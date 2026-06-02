@@ -1,5 +1,5 @@
-import { getConnectedClient } from "./clients";
-import { listAccountIds, resolveAccountConfig } from "./config";
+import { connectedClientCount, getConnectedClient, startAccountClient, stopAllClients } from "./clients";
+import { getOpenIMAccountConfig, listAccountIds, resolveAccountConfig } from "./config";
 import { sendTextToTarget } from "./media";
 import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
@@ -45,6 +45,31 @@ export const OpenIMChannelPlugin = {
       } catch (e: any) {
         return { ok: false, error: new Error(formatSdkError(e)) };
       }
+    },
+  },
+  gateway: {
+    startAccount: async (ctx: any) => {
+      const account = getOpenIMAccountConfig(ctx, ctx.accountId);
+      if (!account) {
+        ctx.log?.error?.(`[openim] no account config found for ${ctx.accountId}`);
+        return;
+      }
+      ctx.setStatus({ accountId: ctx.accountId, running: true });
+      ctx.log?.info?.(`[openim] starting openim[${ctx.accountId}]...`);
+      await startAccountClient(ctx, account);
+      if (connectedClientCount() > 0) {
+        ctx.setStatus({ accountId: ctx.accountId, running: true, lastStartAt: Date.now() });
+        ctx.log?.info?.(`[openim] openim[${ctx.accountId}] started`);
+      } else {
+        ctx.setStatus({ accountId: ctx.accountId, running: false, lastError: "Failed to connect" });
+        ctx.log?.error?.(`[openim] openim[${ctx.accountId}] start failed`);
+      }
+    },
+    stopAccount: async (ctx: any) => {
+      ctx.log?.info?.(`[openim] stopping openim[${ctx.accountId}]...`);
+      await stopAllClients(ctx);
+      ctx.setStatus({ accountId: ctx.accountId, running: false, lastStopAt: Date.now() });
+      ctx.log?.info?.(`[openim] openim[${ctx.accountId}] stopped`);
     },
   },
 };
