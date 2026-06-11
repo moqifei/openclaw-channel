@@ -29,10 +29,10 @@ function guardCancel<T>(value: T | symbol): T {
 export async function runOpenIMSetup(): Promise<void> {
   clackIntro("OpenIM Channel Setup Wizard");
 
-  const token = guardCancel(
+  const userID = guardCancel(
     await clackText({
-      message: "Enter OpenIM Access Token",
-      initialValue: process.env.OPENIM_TOKEN || "",
+      message: "Enter OpenIM User ID",
+      initialValue: process.env.OPENIM_USER_ID || "",
     })
   );
 
@@ -50,12 +50,12 @@ export async function runOpenIMSetup(): Promise<void> {
     })
   );
 
-  const trimmedToken = String(token).trim();
+  const trimmedUserID = String(userID).trim();
   const trimmedWsAddr = String(wsAddr).trim();
   const trimmedApiAddr = String(apiAddr).trim();
 
-  if (!trimmedToken || !trimmedWsAddr || !trimmedApiAddr) {
-    console.error("Configuration fields `token`, `wsAddr`, and `apiAddr` cannot be empty.");
+  if (!trimmedUserID || !trimmedWsAddr || !trimmedApiAddr) {
+    console.error("Configuration fields `userID`, `wsAddr`, and `apiAddr` cannot be empty.");
     process.exit(1);
   }
 
@@ -74,7 +74,7 @@ export async function runOpenIMSetup(): Promise<void> {
 
   accounts.default = {
     enabled: true,
-    token: trimmedToken,
+    userID: trimmedUserID,
     wsAddr: trimmedWsAddr,
     apiAddr: trimmedApiAddr,
   };
@@ -91,7 +91,7 @@ export async function runOpenIMSetup(): Promise<void> {
   writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf-8");
 
   clackNote(
-    `Default account configuration written to: ${CONFIG_PATH}\nuserID/platformID are auto-derived from JWT token claims when omitted.`,
+    `Default account configuration written to: ${CONFIG_PATH}\nA fresh OpenIM token will be generated from userID when the plugin starts.`,
     "Setup complete"
   );
   clackOutro("Run `openclaw gateway restart` to load the updated configuration.");

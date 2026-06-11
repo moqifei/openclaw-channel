@@ -1,5 +1,6 @@
 import { CbEvents, getSDK, type CallbackEvent, type MessageItem } from "@openim/client-sdk";
 import { processInboundMessage } from "./inbound";
+import { resolveAccountToken } from "./token";
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
 import { formatSdkError } from "./utils";
 
@@ -27,43 +28,46 @@ export function connectedClientCount(): number {
 
 export async function startAccountClient(api: any, config: OpenIMAccountConfig): Promise<void> {
   const sdk = getSDK();
-
-  const state = {
-    sdk,
-    config,
-    handlers: {
-      onRecvNewMessage: () => undefined,
-      onRecvNewMessages: () => undefined,
-      onRecvOfflineNewMessages: () => undefined,
-    },
-  } as OpenIMClientState;
-
-  const consumeMessage = (msg: MessageItem) => {
-    processInboundMessage(api, state, msg).catch((e: any) => {
-      api.logger?.error?.(`[openim] processInboundMessage failed: ${formatSdkError(e)}`);
-    });
-  };
-
-  state.handlers.onRecvNewMessage = (event: CallbackEvent<MessageItem>) => {
-    if (event?.data) consumeMessage(event.data);
-  };
-  state.handlers.onRecvNewMessages = (event: CallbackEvent<MessageItem[]>) => {
-    const list = Array.isArray(event?.data) ? event.data : [];
-    for (const msg of list) consumeMessage(msg);
-  };
-  state.handlers.onRecvOfflineNewMessages = (event: CallbackEvent<MessageItem[]>) => {
-    const list = Array.isArray(event?.data) ? event.data : [];
-    for (const msg of list) consumeMessage(msg);
-  };
-
-  sdk.on(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
-  sdk.on(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
-  sdk.on(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
-
+  let state: OpenIMClientState | null = null;
   try {
+    const token = await resolveAccountToken(config);
+    const resolvedConfig = { ...config, token };
+
+    state = {
+      sdk,
+      config: resolvedConfig,
+      handlers: {
+        onRecvNewMessage: () => undefined,
+        onRecvNewMessages: () => undefined,
+        onRecvOfflineNewMessages: () => undefined,
+      },
+    } as OpenIMClientState;
+
+    const consumeMessage = (msg: MessageItem) => {
+      processInboundMessage(api, state as OpenIMClientState, msg).catch((e: any) => {
+        api.logger?.error?.(`[openim] processInboundMessage failed: ${formatSdkError(e)}`);
+      });
+    };
+
+    state.handlers.onRecvNewMessage = (event: CallbackEvent<MessageItem>) => {
+      if (event?.data) consumeMessage(event.data);
+    };
+    state.handlers.onRecvNewMessages = (event: CallbackEvent<MessageItem[]>) => {
+      const list = Array.isArray(event?.data) ? event.data : [];
+      for (const msg of list) consumeMessage(msg);
+    };
+    state.handlers.onRecvOfflineNewMessages = (event: CallbackEvent<MessageItem[]>) => {
+      const list = Array.isArray(event?.data) ? event.data : [];
+      for (const msg of list) consumeMessage(msg);
+    };
+
+    sdk.on(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
+    sdk.on(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
+    sdk.on(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
+
     await sdk.login({
       userID: config.userID,
-      token: config.token,
+      token,
       wsAddr: config.wsAddr,
       apiAddr: config.apiAddr,
       platformID: config.platformID,
@@ -71,7 +75,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
     clients.set(config.accountId, state);
     api.logger?.info?.(`[openim] account ${config.accountId} connected`);
   } catch (e: any) {
-    detachHandlers(state);
+    if (state) detachHandlers(state);
     api.logger?.error?.(`[openim] account ${config.accountId} login failed: ${formatSdkError(e)}`);
   }
 }

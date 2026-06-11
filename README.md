@@ -54,7 +54,7 @@ openclaw openim setup
       "accounts": {
         "default": {
           "enabled": true,
-          "token": "your_token",
+          "userID": "9036580386",
           "wsAddr": "ws://127.0.0.1:10001",
           "apiAddr": "http://127.0.0.1:10002"
         }
@@ -64,7 +64,9 @@ openclaw openim setup
 }
 ```
 
-`userID` and `platformID` are optional. If omitted, they are auto-derived from JWT token claims (`UserID` and `PlatformID`).
+The recommended setup is to configure the stable `userID`. On startup, the plugin calls `/auth/get_admin_token`, then `/auth/get_user_token` to generate a fresh login token. `adminSecret` defaults to `openIM123`, `adminUserID` defaults to `imAdmin`, and `platformID` defaults to `12`.
+
+Static `token` configuration is still supported. In that mode, `userID` and `platformID` are optional and auto-derived from JWT token claims (`UserID` and `PlatformID`) when omitted.
 
 `requireMention` is optional and defaults to `true`.
 
@@ -78,8 +80,11 @@ Single-account fallback (without `accounts`) is supported.
 Environment fallback is supported for the `default` account:
 
 - `OPENIM_TOKEN`
+- `OPENIM_USER_ID`
 - `OPENIM_WS_ADDR`
 - `OPENIM_API_ADDR`
+- `OPENIM_ADMIN_SECRET`
+- `OPENIM_ADMIN_USER_ID`
 
 Optional env overrides:
 

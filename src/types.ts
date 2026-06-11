@@ -6,10 +6,12 @@ export interface OpenIMAccountConfig {
   accountId: string;
   enabled: boolean;
   userID: string;
-  token: string;
+  token?: string;
   wsAddr: string;
   apiAddr: string;
   platformID: number;
+  adminSecret: string;
+  adminUserID: string;
   requireMention: boolean;
   inboundWhitelist: string[];
 }

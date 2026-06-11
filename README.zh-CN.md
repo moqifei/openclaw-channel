@@ -54,7 +54,7 @@ openclaw openim setup
       "accounts": {
         "default": {
           "enabled": true,
-          "token": "your_token",
+          "userID": "9036580386",
           "wsAddr": "ws://127.0.0.1:10001",
           "apiAddr": "http://127.0.0.1:10002"
         }
@@ -64,7 +64,9 @@ openclaw openim setup
 }
 ```
 
-`userID` 和 `platformID` 为可选项，未填写时会自动从 JWT token 的 `UserID` / `PlatformID` 声明解析。
+推荐配置固定的 `userID`，插件启动时会先调用 `/auth/get_admin_token`，再调用 `/auth/get_user_token` 自动生成登录 token。`adminSecret` 默认 `openIM123`，`adminUserID` 默认 `imAdmin`，`platformID` 默认 `12`。
+
+仍支持直接配置静态 `token`。此时 `userID` 和 `platformID` 为可选项，未填写时会自动从 JWT token 的 `UserID` / `PlatformID` 声明解析。
 
 `requireMention` 为可选项，默认 `true`。
 
@@ -77,8 +79,11 @@ openclaw openim setup
 `default` 账号支持环境变量兜底：
 
 - `OPENIM_TOKEN`
+- `OPENIM_USER_ID`
 - `OPENIM_WS_ADDR`
 - `OPENIM_API_ADDR`
+- `OPENIM_ADMIN_SECRET`
+- `OPENIM_ADMIN_USER_ID`
 
 可选环境变量覆盖项：
 

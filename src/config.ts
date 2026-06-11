@@ -47,21 +47,24 @@ function extractAccountHintsFromToken(token: string): { userID?: string; platfor
 
 function envDefaultAccount(): Record<string, unknown> | null {
   const token = String(process.env.OPENIM_TOKEN ?? "").trim();
-  const wsAddr = String(process.env.OPENIM_WS_ADDR ?? "").trim();
-  const apiAddr = String(process.env.OPENIM_API_ADDR ?? "").trim();
-  if (!token || !wsAddr || !apiAddr) return null;
+  const userIDFromEnv = String(process.env.OPENIM_USER_ID ?? "").trim();
+  const wsAddr = String(process.env.OPENIM_WS_ADDR ?? "ws://127.0.0.1:10001").trim();
+  const apiAddr = String(process.env.OPENIM_API_ADDR ?? "http://127.0.0.1:10002").trim();
+  if (!token && !userIDFromEnv) return null;
 
-  const hints = extractAccountHintsFromToken(token);
-  const userID = String(process.env.OPENIM_USER_ID ?? hints.userID ?? "").trim();
-  const platformID = toFiniteNumber(process.env.OPENIM_PLATFORM_ID ?? hints.platformID, 5);
+  const hints = token ? extractAccountHintsFromToken(token) : {};
+  const userID = String(userIDFromEnv || hints.userID || "").trim();
+  const platformID = toFiniteNumber(process.env.OPENIM_PLATFORM_ID ?? hints.platformID, token ? 5 : 12);
   if (!userID) return null;
 
   return {
     userID,
-    token,
+    ...(token ? { token } : {}),
     wsAddr,
     apiAddr,
     platformID,
+    adminSecret: process.env.OPENIM_ADMIN_SECRET,
+    adminUserID: process.env.OPENIM_ADMIN_USER_ID,
     enabled: true,
     requireMention: true,
   };
@@ -81,27 +84,31 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
   if (!raw || typeof raw !== "object") return null;
 
   const token = String(raw.token ?? "").trim();
-  const wsAddr = String(raw.wsAddr ?? "").trim();
-  const apiAddr = String(raw.apiAddr ?? "").trim();
-  if (!token || !wsAddr || !apiAddr) return null;
+  const wsAddr = String(raw.wsAddr ?? "ws://127.0.0.1:10001").trim();
+  const apiAddr = String(raw.apiAddr ?? "http://127.0.0.1:10002").trim();
 
-  const hints = extractAccountHintsFromToken(token);
+  const hints = token ? extractAccountHintsFromToken(token) : {};
   const userID = String(raw.userID ?? hints.userID ?? "").trim();
-  const platformID = toFiniteNumber(raw.platformID ?? hints.platformID, 5);
+  const platformID = toFiniteNumber(raw.platformID ?? hints.platformID, token ? 5 : 12);
+  const adminSecret = String(raw.adminSecret ?? raw.secret ?? "openIM123").trim();
+  const adminUserID = String(raw.adminUserID ?? raw.adminID ?? "imAdmin").trim();
   const enabled = raw.enabled !== false;
   const requireMention = raw.requireMention !== false;
   const inboundWhitelist = normalizeInboundWhitelist(raw.inboundWhitelist);
 
-  if (!userID) return null;
+  if (!userID || !wsAddr || !apiAddr) return null;
+  if (!token && (!adminSecret || !adminUserID)) return null;
 
   return {
     accountId,
     enabled,
     userID,
-    token,
+    ...(token ? { token } : {}),
     wsAddr,
     apiAddr,
     platformID,
+    adminSecret,
+    adminUserID,
     requireMention,
     inboundWhitelist,
   };
