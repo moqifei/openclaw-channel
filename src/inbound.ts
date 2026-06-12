@@ -1,6 +1,7 @@
 import { SessionType, type MessageItem } from "@openim/client-sdk";
 import { sendTextToTarget } from "./media";
 import type { ChatType, InboundBodyResult, InboundMediaItem, OpenIMClientState, ParsedTarget } from "./types";
+import { resolveOpenIMUserInfo } from "./user";
 import { formatSdkError } from "./utils";
 
 const inboundDedup = new Map<string, number>();
@@ -340,9 +341,17 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       agentId: route.agentId,
     }) ?? "";
 
-  const chatType: ChatType = group ? "group" : "direct";
-  const fromLabel = String(msg.senderNickname || msg.sendID);
   const senderId = String(msg.sendID);
+  const userInfo = await resolveOpenIMUserInfo({
+    client,
+    userID: senderId,
+    fallbackName: String(msg.senderNickname || ""),
+    log: (line) => api.logger?.warn?.(String(line)),
+  });
+  api.logger?.info?.(`[openim] user info for ${senderId}: name=${userInfo.name} username=${userInfo.username}`);
+
+  const chatType: ChatType = group ? "group" : "direct";
+  const fromLabel = userInfo.name || String(msg.senderNickname || msg.sendID);
   const timestamp = msg.sendTime || Date.now();
   const mediaResult = await materializeInboundMedia(inbound.media);
   const warningText = mediaResult.warnings.map((warning) => `[Media fetch failed] ${warning}`).join("\n");
@@ -366,6 +375,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     ConversationLabel: fromLabel,
     SenderName: fromLabel,
     SenderId: senderId,
+    SenderUsername: userInfo.username,
     Provider: "openim",
     Surface: "openim",
     MessageSid: msg.clientMsgID || `openim-${Date.now()}`,
@@ -377,6 +387,8 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       accountId: client.config.accountId,
       isGroup: group,
       senderId,
+      senderName: fromLabel,
+      username: userInfo.username,
       groupId: String(msg.groupID || ""),
       messageKind: inbound.kind,
       mediaCount: inbound.media?.length ?? 0,

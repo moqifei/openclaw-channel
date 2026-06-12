@@ -19,6 +19,10 @@
         "type": "string",
         "description": "OpenIM JWT token (used to derive userID/platformID when omitted)"
       },
+      "userID": {
+        "type": "string",
+        "description": "Stable OpenIM bot user ID. When token is omitted, the plugin generates a fresh token on startup."
+      },
       "wsAddr": {
         "type": "string",
         "description": "OpenIM WebSocket endpoint, e.g. ws://127.0.0.1:10001"
@@ -26,6 +30,51 @@
       "apiAddr": {
         "type": "string",
         "description": "OpenIM API endpoint, e.g. http://127.0.0.1:10002"
+      },
+      "platformID": {
+        "type": "number",
+        "default": 12
+      },
+      "adminSecret": {
+        "type": "string",
+        "default": "openIM123"
+      },
+      "adminUserID": {
+        "type": "string",
+        "default": "imAdmin"
+      },
+      "chatApiAddr": {
+        "type": "string",
+        "description": "Optional OpenIM Chat API endpoint. When set with chatToken, user account/AD username is resolved from /user/find/full."
+      },
+      "chatToken": {
+        "type": "string",
+        "description": "Optional OpenIM Chat token used to query /user/find/full."
+      },
+      "http_token_injector": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Inject external gateway auth tokens for OpenIM-originated http_get/http_post calls.",
+        "properties": {
+          "token_service_url": {
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          },
+          "token_ttl_ms": {
+            "type": "number",
+            "default": 300000
+          },
+          "user_cache_ttl_ms": {
+            "type": "number",
+            "default": 1800000
+          },
+          "target_url_prefix": {
+            "type": "string",
+            "default": "http://"
+          }
+        }
       },
       "requireMention": {
         "type": "boolean",
@@ -55,10 +104,31 @@
               "type": "string",
               "description": "OpenIM JWT token"
             },
+            "userID": {
+              "type": "string"
+            },
             "wsAddr": {
               "type": "string"
             },
             "apiAddr": {
+              "type": "string"
+            },
+            "platformID": {
+              "type": "number",
+              "default": 12
+            },
+            "adminSecret": {
+              "type": "string",
+              "default": "openIM123"
+            },
+            "adminUserID": {
+              "type": "string",
+              "default": "imAdmin"
+            },
+            "chatApiAddr": {
+              "type": "string"
+            },
+            "chatToken": {
               "type": "string"
             },
             "requireMention": {
@@ -78,6 +148,9 @@
     }
   },
   "uiHints": {
+    "userID": {
+      "label": "OpenIM User ID"
+    },
     "token": {
       "label": "Token",
       "sensitive": true
@@ -89,6 +162,20 @@
     "apiAddr": {
       "label": "API Endpoint",
       "placeholder": "http://127.0.0.1:10002"
+    },
+    "adminSecret": {
+      "label": "Admin Secret",
+      "sensitive": true
+    },
+    "adminUserID": {
+      "label": "Admin User ID"
+    },
+    "chatApiAddr": {
+      "label": "Chat API Endpoint"
+    },
+    "chatToken": {
+      "label": "Chat Token",
+      "sensitive": true
     },
     "requireMention": {
       "label": "Require Mention in Group"

@@ -68,6 +68,25 @@ The recommended setup is to configure the stable `userID`. On startup, the plugi
 
 Static `token` configuration is still supported. In that mode, `userID` and `platformID` are optional and auto-derived from JWT token claims (`UserID` and `PlatformID`) when omitted.
 
+### External Gateway Token Injection
+
+To call external HTTP gateways such as OA from OpenIM conversations, configure `http_token_injector`:
+
+```yaml
+plugins:
+  entries:
+    openclaw-channel:
+      enabled: true
+      config:
+        http_token_injector:
+          token_service_url: "https://your-auth-service/validateUser"
+          public_key: "your-public-key"
+          token_ttl_ms: 300000
+          target_url_prefix: "http://10."
+```
+
+The plugin caches the OpenIM sender profile on inbound messages. When `chatApiAddr` and `chatToken` are configured on the account, it first calls Chat API `/user/find/full` and uses `account` as the external gateway `username`, preserving AD accounts such as `co_guantenghui`. Otherwise, it reads `username` / `account` / `pinyin` / `email` from the OpenIM user `ex` field. Nickname-to-pinyin is only the final fallback. The hook only handles `channel=openim` `http_get` / `http_post` calls, keeping it isolated from Feishu.
+
 `requireMention` is optional and defaults to `true`.
 
 `inboundWhitelist` is optional. If omitted or empty, inbound handling keeps existing behavior.

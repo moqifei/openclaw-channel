@@ -92,6 +92,8 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
   const platformID = toFiniteNumber(raw.platformID ?? hints.platformID, token ? 5 : 12);
   const adminSecret = String(raw.adminSecret ?? raw.secret ?? "openIM123").trim();
   const adminUserID = String(raw.adminUserID ?? raw.adminID ?? "imAdmin").trim();
+  const chatApiAddr = String(raw.chatApiAddr ?? raw.chatAddr ?? "").trim();
+  const chatToken = String(raw.chatToken ?? "").trim();
   const enabled = raw.enabled !== false;
   const requireMention = raw.requireMention !== false;
   const inboundWhitelist = normalizeInboundWhitelist(raw.inboundWhitelist);
@@ -109,6 +111,8 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
     platformID,
     adminSecret,
     adminUserID,
+    ...(chatApiAddr ? { chatApiAddr } : {}),
+    ...(chatToken ? { chatToken } : {}),
     requireMention,
     inboundWhitelist,
   };

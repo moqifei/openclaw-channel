@@ -9,6 +9,7 @@ import "./polyfills";
 import { OpenIMChannelPlugin } from "./channel";
 import { connectedClientCount, startAccountClient, stopAllClients } from "./clients";
 import { listEnabledAccountConfigs } from "./config";
+import { registerHttpTokenInjector } from "./http-token-injector";
 import { registerOpenIMTools } from "./tools";
 
 export default function register(api: any): void {
@@ -34,6 +35,7 @@ export default function register(api: any): void {
   }
 
   registerOpenIMTools(api);
+  registerHttpTokenInjector(api);
 
   api.registerService({
     id: "openim-sdk",

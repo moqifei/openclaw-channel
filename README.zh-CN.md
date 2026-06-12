@@ -68,6 +68,25 @@ openclaw openim setup
 
 仍支持直接配置静态 `token`。此时 `userID` 和 `platformID` 为可选项，未填写时会自动从 JWT token 的 `UserID` / `PlatformID` 声明解析。
 
+### 外部网关 Token 注入
+
+如需在 OpenIM 会话中调用 OA 等外部 HTTP 网关，可在插件配置中启用 `http_token_injector`：
+
+```yaml
+plugins:
+  entries:
+    openclaw-channel:
+      enabled: true
+      config:
+        http_token_injector:
+          token_service_url: "https://your-auth-service/validateUser"
+          public_key: "your-public-key"
+          token_ttl_ms: 300000
+          target_url_prefix: "http://10."
+```
+
+插件会在收到 OpenIM 消息时缓存发送人的用户资料。若账号配置了 `chatApiAddr` 和 `chatToken`，会先调用 Chat API `/user/find/full` 读取 `account` 作为外部网关的 `username`，可正确保留 AD 账号如 `co_guantenghui`；否则读取 OpenIM 用户资料 `ex` 里的 `username` / `account` / `pinyin` / `email`。只有前两者都没有时才退回 `nickname` 转拼音。hook 只处理 `channel=openim` 的 `http_get` / `http_post`，不会处理飞书会话。
+
 `requireMention` 为可选项，默认 `true`。
 
 `inboundWhitelist` 为可选项，不填或为空时保持当前逻辑；填了后仅处理白名单用户触发的消息：

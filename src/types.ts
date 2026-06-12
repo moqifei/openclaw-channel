@@ -12,6 +12,8 @@ export interface OpenIMAccountConfig {
   platformID: number;
   adminSecret: string;
   adminUserID: string;
+  chatApiAddr?: string;
+  chatToken?: string;
   requireMention: boolean;
   inboundWhitelist: string[];
 }
