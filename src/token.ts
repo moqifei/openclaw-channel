@@ -49,9 +49,9 @@ async function postJson<T>(apiAddr: string, path: string, headers: Record<string
   return parsed as T;
 }
 
-export async function resolveAccountToken(config: OpenIMAccountConfig): Promise<string> {
+export async function resolveAccountToken(config: OpenIMAccountConfig, options: { forceRefresh?: boolean } = {}): Promise<string> {
   const existing = String(config.token ?? "").trim();
-  if (existing) return existing;
+  if (existing && !options.forceRefresh) return existing;
 
   const adminBody = await postJson<OpenIMTokenResponse>(
     config.apiAddr,

@@ -15,16 +15,30 @@ export interface OpenIMAccountConfig {
   chatApiAddr?: string;
   chatToken?: string;
   requireMention: boolean;
+  processOfflineMessages: boolean;
   inboundWhitelist: string[];
 }
 
 export interface OpenIMClientState {
   sdk: ApiService;
   config: OpenIMAccountConfig;
+  messageAcceptAfterMs: number;
+  replayFilterUntilMs: number;
   handlers: {
     onRecvNewMessage: (event: CallbackEvent<MessageItem>) => void;
     onRecvNewMessages: (event: CallbackEvent<MessageItem[]>) => void;
     onRecvOfflineNewMessages: (event: CallbackEvent<MessageItem[]>) => void;
+    onUserTokenExpired?: (event: CallbackEvent<unknown>) => void;
+    onUserTokenInvalid?: (event: CallbackEvent<unknown>) => void;
+    onKickedOffline?: (event: CallbackEvent<unknown>) => void;
+    onConnectFailed?: (event: CallbackEvent<unknown>) => void;
+    onConnectSuccess?: (event: CallbackEvent<unknown>) => void;
+  };
+  reconnect?: {
+    timer?: ReturnType<typeof setTimeout>;
+    attempts: number;
+    running: boolean;
+    stopped: boolean;
   };
 }
 

@@ -96,6 +96,7 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
   const chatToken = String(raw.chatToken ?? "").trim();
   const enabled = raw.enabled !== false;
   const requireMention = raw.requireMention !== false;
+  const processOfflineMessages = raw.processOfflineMessages === true;
   const inboundWhitelist = normalizeInboundWhitelist(raw.inboundWhitelist);
 
   if (!userID || !wsAddr || !apiAddr) return null;
@@ -114,6 +115,7 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
     ...(chatApiAddr ? { chatApiAddr } : {}),
     ...(chatToken ? { chatToken } : {}),
     requireMention,
+    processOfflineMessages,
     inboundWhitelist,
   };
 }

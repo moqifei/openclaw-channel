@@ -5,11 +5,13 @@ import { resolveOpenIMUserInfo } from "./user";
 import { formatSdkError } from "./utils";
 
 const inboundDedup = new Map<string, number>();
-const INBOUND_DEDUP_TTL_MS = 5 * 60 * 1000;
+const INBOUND_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_INBOUND_DEDUP_SIZE = 20000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
 
 type ImagePart = { type: "image"; data: string; mimeType: string };
+export type InboundMessageSource = "live" | "batch" | "offline";
 
 function normalizeImageMimeType(value: unknown): string | undefined {
   const mime = String(value ?? "").trim().toLowerCase();
@@ -257,13 +259,29 @@ function shouldProcessInboundMessage(accountId: string, msg: MessageItem): boole
   const last = inboundDedup.get(key);
   inboundDedup.set(key, now);
 
-  if (inboundDedup.size > 2000) {
+  if (inboundDedup.size > MAX_INBOUND_DEDUP_SIZE) {
     for (const [k, ts] of inboundDedup.entries()) {
       if (now - ts > INBOUND_DEDUP_TTL_MS) inboundDedup.delete(k);
+    }
+    if (inboundDedup.size > MAX_INBOUND_DEDUP_SIZE) {
+      const stale = Array.from(inboundDedup.entries()).sort((a, b) => a[1] - b[1]);
+      for (const [k] of stale.slice(0, inboundDedup.size - MAX_INBOUND_DEDUP_SIZE)) {
+        inboundDedup.delete(k);
+      }
     }
   }
 
   return !(last && now - last < INBOUND_DEDUP_TTL_MS);
+}
+
+function getMessageTimeMs(msg: MessageItem): number {
+  const raw = Number(msg.sendTime || msg.createTime || 0);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return raw < 10_000_000_000 ? raw * 1000 : raw;
+}
+
+function messageIDForLog(msg: MessageItem): string {
+  return String(msg.clientMsgID || msg.serverMsgID || `${msg.sendID}-${msg.seq || msg.createTime || 0}` || "unknown");
 }
 
 function isGroupMessage(msg: MessageItem): boolean {
@@ -291,10 +309,62 @@ async function sendReplyFromInbound(client: OpenIMClientState, msg: MessageItem,
   await sendTextToTarget(client, target, text);
 }
 
-export async function processInboundMessage(api: any, client: OpenIMClientState, msg: MessageItem): Promise<void> {
+function getConversationIDByInboundMessage(client: OpenIMClientState, msg: MessageItem): string {
+  const sessionType = Number(msg.sessionType);
+  if (sessionType === SessionType.Group && msg.groupID) {
+    return `sg_${msg.groupID}`;
+  }
+  if (sessionType === SessionType.Notification) {
+    return `sn_${[msg.sendID, msg.recvID || client.config.userID].map(String).sort().join("_")}`;
+  }
+  return `si_${[msg.sendID, msg.recvID || client.config.userID].map(String).sort().join("_")}`;
+}
+
+async function markInboundConversationAsRead(api: any, client: OpenIMClientState, msg: MessageItem, reason: string): Promise<void> {
+  const conversationID = getConversationIDByInboundMessage(client, msg);
+  if (!conversationID) return;
+
+  try {
+    await client.sdk.markConversationMessageAsRead(conversationID);
+    api.logger?.info?.(`[openim] marked conversation as read: conversationID=${conversationID}, reason=${reason}, msgID=${messageIDForLog(msg)}`);
+  } catch (err) {
+    const text = formatSdkError(err);
+    if (/hasReadSeq equal max|unread count is zero|conversation not exist/i.test(text)) {
+      api.logger?.info?.(`[openim] mark read skipped: conversationID=${conversationID}, reason=${reason}, detail=${text}`);
+      return;
+    }
+    api.logger?.warn?.(`[openim] mark conversation as read failed: conversationID=${conversationID}, reason=${reason}, error=${text}`);
+  }
+}
+
+export async function processInboundMessage(
+  api: any,
+  client: OpenIMClientState,
+  msg: MessageItem,
+  source: InboundMessageSource = "live"
+): Promise<void> {
   const runtime = api.runtime;
   if (!runtime?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
     api.logger?.warn?.("[openim] runtime.channel.reply not available");
+    return;
+  }
+
+  const msgID = messageIDForLog(msg);
+  if (source === "offline" && !client.config.processOfflineMessages) {
+    shouldProcessInboundMessage(client.config.accountId, msg);
+    await markInboundConversationAsRead(api, client, msg, "offline-sync");
+    api.logger?.info?.(`[openim] ignore offline synced message: msgID=${msgID}`);
+    return;
+  }
+
+  const msgTime = getMessageTimeMs(msg);
+  const replayFilterActive = Date.now() <= client.replayFilterUntilMs;
+  if (!client.config.processOfflineMessages && replayFilterActive && msgTime > 0 && msgTime < client.messageAcceptAfterMs) {
+    shouldProcessInboundMessage(client.config.accountId, msg);
+    await markInboundConversationAsRead(api, client, msg, "historical-replay");
+    api.logger?.info?.(
+      `[openim] ignore historical replay message: source=${source}, msgID=${msgID}, msgTime=${msgTime}, acceptAfter=${client.messageAcceptAfterMs}, filterUntil=${client.replayFilterUntilMs}`
+    );
     return;
   }
 
@@ -302,6 +372,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     return;
   }
   if (!shouldProcessInboundMessage(client.config.accountId, msg)) {
+    await markInboundConversationAsRead(api, client, msg, "duplicate");
     return;
   }
 
@@ -310,6 +381,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     api.logger?.info?.(
       `[openim] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`
     );
+    await markInboundConversationAsRead(api, client, msg, "unsupported");
     return;
   }
 
@@ -317,11 +389,20 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const mentioned = group && isMentionedInGroup(msg, client.config.userID);
   const hasWhitelist = client.config.inboundWhitelist.length > 0;
   if (hasWhitelist) {
-    if (!isWhitelistedSender(client, msg)) return;
-    if (group && !mentioned) return;
+    if (!isWhitelistedSender(client, msg)) {
+      await markInboundConversationAsRead(api, client, msg, "not-whitelisted");
+      return;
+    }
+    if (group && !mentioned) {
+      await markInboundConversationAsRead(api, client, msg, "not-mentioned");
+      return;
+    }
   } else if (group && client.config.requireMention && !mentioned) {
+    await markInboundConversationAsRead(api, client, msg, "not-mentioned");
     return;
   }
+
+  await markInboundConversationAsRead(api, client, msg, "accepted");
 
   const baseSessionKey = group ? `openim:group:${msg.groupID}`.toLowerCase() : `openim:${msg.sendID}`.toLowerCase();
   const cfg = api.config;
@@ -392,6 +473,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       groupId: String(msg.groupID || ""),
       messageKind: inbound.kind,
       mediaCount: inbound.media?.length ?? 0,
+      source,
     },
   };
 
