@@ -1,5 +1,6 @@
 import { connectedClientCount, getConnectedClient, startAccountClient, stopAllClients } from "./clients";
 import { getOpenIMAccountConfig, listAccountIds, resolveAccountConfig } from "./config";
+import { OpenIMDigitalTwinProtocol } from "./digital-twin";
 import { sendTextToTarget } from "./media";
 import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
@@ -16,6 +17,7 @@ export const OpenIMChannelPlugin = {
   },
   capabilities: {
     chatTypes: ["direct", "group"],
+    digitalTwin: OpenIMDigitalTwinProtocol,
   },
   config: {
     listAccountIds: (cfg: any) => listAccountIds(cfg),

@@ -109,6 +109,16 @@ plugins:
 - `OPENIM_USER_ID`
 - `OPENIM_PLATFORM_ID`
 
+### 数字分身协议
+
+OpenIM 数字分身模式建议使用 HTTP 任务协议，而不是为每个分身建立一个 WebSocket 账号连接。
+
+- Bot 模式：继续使用 WebSocket 账号，适合少量显式配置的 OpenIM 机器人。
+- 数字分身模式：Chat 通过 HTTP 调用 Orange 的 `/api/v1/digital-twin/reply`；请求体携带 `ownerUserID`、`senderUserID`、消息内容和 prompt。
+- 插件暴露 `OpenIMDigitalTwinProtocol`，其中 `mode=http_task` 且 `perTwinAccount=false`。
+- Orange 应使用 `accountId=digital_twin:<ownerUserID>` 做会话隔离，而不是要求每个分身都配置一个 OpenIM 账号。
+- Orange 应使用 `agentId=digital_twin__<ownerUserID>` 和 `workspaceScope=digital_twin_owner` 做分身工作空间隔离，避免复用主 OpenIM Bot 的 agent/workspace。
+
 ## Agent 工具
 
 - `openim_send_text`

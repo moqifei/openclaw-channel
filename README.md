@@ -110,6 +110,16 @@ Optional env overrides:
 - `OPENIM_USER_ID`
 - `OPENIM_PLATFORM_ID`
 
+### Digital Twin Protocol
+
+OpenIM digital twin mode should use an HTTP task protocol instead of one WebSocket account per twin.
+
+- Bot mode: keep using WebSocket accounts for a small number of explicitly configured OpenIM bots.
+- Digital twin mode: Chat calls Orange over HTTP at `/api/v1/digital-twin/reply`; the payload carries `ownerUserID`, `senderUserID`, message content, and prompt.
+- The plugin exposes `OpenIMDigitalTwinProtocol` with `mode=http_task` and `perTwinAccount=false`.
+- Orange should isolate sessions with `accountId=digital_twin:<ownerUserID>` rather than requiring a configured OpenIM account for every twin.
+- Orange should isolate digital twin workspaces with `agentId=digital_twin__<ownerUserID>` and `workspaceScope=digital_twin_owner`, so the main OpenIM bot agent/workspace is not reused.
+
 ## Agent Tools
 
 - `openim_send_text`

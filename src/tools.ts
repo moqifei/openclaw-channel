@@ -1,10 +1,95 @@
 import { getConnectedClient } from "./clients";
+import {
+  buildOpenIMDigitalTwinPrompt,
+  normalizeOpenIMDigitalTwinReply,
+  normalizeOpenIMDigitalTwinTask,
+  type OpenIMDigitalTwinReply,
+  type OpenIMDigitalTwinTask,
+} from "./digital-twin";
 import { sendFileToTarget, sendImageToTarget, sendTextToTarget, sendVideoToTarget } from "./media";
 import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
 
 export function registerOpenIMTools(api: any): void {
   if (typeof api.registerTool !== "function") return;
+
+  api.registerTool({
+    name: "openim_digital_twin_prepare",
+    description:
+      "Normalize an OpenIM digital twin HTTP task. This does not open an OpenIM WebSocket account; it returns the session/account scope and prompt for Orange dispatch.",
+    parameters: {
+      type: "object",
+      properties: {
+        ownerUserID: { type: "string", description: "Digital twin owner OpenIM user ID" },
+        senderUserID: { type: "string", description: "Original sender OpenIM user ID" },
+        messageContent: { type: "string", description: "Original text message content" },
+        fallbackReplyText: { type: "string", description: "Fallback reply text" },
+        prompt: { type: "string", description: "Owner-provided digital twin prompt/persona" },
+        serverMsgID: { type: "string", description: "OpenIM server message ID" },
+        clientMsgID: { type: "string", description: "OpenIM client message ID" },
+        operationID: { type: "string", description: "OpenIM operation ID" },
+      },
+      required: ["ownerUserID", "senderUserID", "messageContent"],
+    },
+    async execute(_id: string, params: OpenIMDigitalTwinTask) {
+      try {
+        const task = normalizeOpenIMDigitalTwinTask(params);
+        return {
+          ok: true,
+          protocol: "openim_digital_twin_http_task",
+          task,
+          dispatch: {
+            channel: task.channel,
+            accountId: task.accountId,
+            agentId: task.agentId,
+            workspaceScope: task.workspaceScope,
+            userId: task.senderUserID,
+            target: task.target,
+            text: buildOpenIMDigitalTwinPrompt(task),
+          },
+        };
+      } catch (e: any) {
+        return {
+          ok: false,
+          error: String(e?.message || e),
+        };
+      }
+    },
+  });
+
+  api.registerTool({
+    name: "openim_digital_twin_finalize",
+    description:
+      "Finalize an OpenIM digital twin reply. This does not send the message; it normalizes reply text and metadata for Chat to send and audit.",
+    parameters: {
+      type: "object",
+      properties: {
+        ownerUserID: { type: "string", description: "Digital twin owner OpenIM user ID" },
+        senderUserID: { type: "string", description: "Original sender OpenIM user ID" },
+        replyText: { type: "string", description: "Generated reply text" },
+        source: { type: "string", description: "Reply generation source" },
+        serverMsgID: { type: "string", description: "OpenIM server message ID" },
+        clientMsgID: { type: "string", description: "OpenIM client message ID" },
+        operationID: { type: "string", description: "OpenIM operation ID" },
+      },
+      required: ["ownerUserID", "senderUserID", "replyText"],
+    },
+    async execute(_id: string, params: OpenIMDigitalTwinReply) {
+      try {
+        const reply = normalizeOpenIMDigitalTwinReply(params);
+        return {
+          ok: true,
+          protocol: "openim_digital_twin_http_task",
+          reply,
+        };
+      } catch (e: any) {
+        return {
+          ok: false,
+          error: String(e?.message || e),
+        };
+      }
+    },
+  });
 
   const ensureTargetAndClient = (params: { target?: string; accountId?: string }) => {
     const target = parseTarget(params.target);

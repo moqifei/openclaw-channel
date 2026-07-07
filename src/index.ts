@@ -12,6 +12,21 @@ import { listEnabledAccountConfigs } from "./config";
 import { registerHttpTokenInjector } from "./http-token-injector";
 import { registerOpenIMTools } from "./tools";
 
+export {
+  OpenIMDigitalTwinProtocol,
+  buildOpenIMDigitalTwinPrompt,
+  digitalTwinAccountId,
+  digitalTwinAgentId,
+  normalizeOpenIMDigitalTwinReply,
+  normalizeOpenIMDigitalTwinTask,
+} from "./digital-twin";
+export type {
+  NormalizedOpenIMDigitalTwinReply,
+  NormalizedOpenIMDigitalTwinTask,
+  OpenIMDigitalTwinReply,
+  OpenIMDigitalTwinTask,
+} from "./digital-twin";
+
 export default function register(api: any): void {
   (globalThis as any).__openimApi = api;
   (globalThis as any).__openimGatewayConfig = api.config;
