@@ -82,6 +82,25 @@ export async function sendTextToTarget(client: OpenIMClientState, target: Parsed
   });
 }
 
+export async function sendCustomToTarget(
+  client: OpenIMClientState,
+  target: ParsedTarget,
+  data: unknown,
+  description = "",
+  extension = ""
+): Promise<void> {
+  const created = await client.sdk.createCustomMessage({
+    data: JSON.stringify(data),
+    description,
+    extension,
+  });
+  const message = created?.data;
+  if (!message) throw new Error("createCustomMessage failed");
+
+  const { recvID, groupID } = getRecvAndGroupID(target);
+  await client.sdk.sendMessage({ recvID, groupID, message });
+}
+
 export async function sendImageToTarget(client: OpenIMClientState, target: ParsedTarget, image: string): Promise<void> {
   const input = image.trim();
   if (!input) throw new Error("image is empty");

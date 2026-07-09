@@ -1,5 +1,5 @@
 import { SessionType, type MessageItem } from "@openim/client-sdk";
-import { sendTextToTarget } from "./media";
+import { sendCustomToTarget, sendTextToTarget } from "./media";
 import type { ChatType, InboundBodyResult, InboundMediaItem, OpenIMClientState, ParsedTarget } from "./types";
 import { resolveOpenIMUserInfo } from "./user";
 import { formatSdkError } from "./utils";
@@ -9,9 +9,12 @@ const INBOUND_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_INBOUND_DEDUP_SIZE = 20000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
+const AGENT_STREAM_EXT_TYPE = "agent_stream";
+const AGENT_STREAM_SEND_INTERVAL_MS = 250;
 
 type ImagePart = { type: "image"; data: string; mimeType: string };
 export type InboundMessageSource = "live" | "batch" | "offline";
+type AgentStreamEvent = "start" | "reasoning" | "answer" | "final" | "error";
 
 function normalizeImageMimeType(value: unknown): string | undefined {
   const mime = String(value ?? "").trim().toLowerCase();
@@ -309,6 +312,129 @@ async function sendReplyFromInbound(client: OpenIMClientState, msg: MessageItem,
   await sendTextToTarget(client, target, text);
 }
 
+function targetFromInboundMessage(msg: MessageItem): ParsedTarget {
+  return isGroupMessage(msg)
+    ? { kind: "group", id: String(msg.groupID) }
+    : { kind: "user", id: String(msg.sendID) };
+}
+
+function createAgentStreamReplyController(
+  client: OpenIMClientState,
+  msg: MessageItem,
+  log?: {
+    debug?: (message: string) => void;
+    info?: (message: string) => void;
+    warn?: (message: string) => void;
+  }
+) {
+  const target = targetFromInboundMessage(msg);
+  const streamID = `openim-agent-stream-${msg.clientMsgID || msg.serverMsgID || Date.now()}`;
+  const basePayload = {
+    openim_ext_type: AGENT_STREAM_EXT_TYPE,
+    version: 1,
+    streamID,
+    accountId: client.config.accountId,
+    agentUserID: client.config.userID,
+    targetUserID: String(msg.sendID || ""),
+    triggerClientMsgID: String(msg.clientMsgID || ""),
+    triggerServerMsgID: String(msg.serverMsgID || ""),
+    createdAt: Date.now(),
+  };
+  let answerText = "";
+  let reasoningText = "";
+  let started = false;
+  let finalized = false;
+  let lastAnswerSentAt = 0;
+  let lastReasoningSentAt = 0;
+  let sendChain = Promise.resolve();
+
+  const enqueue = (event: AgentStreamEvent, force = false, errorText = "") => {
+    if (finalized && event !== "final" && event !== "error") return sendChain;
+    const now = Date.now();
+    if (!force && event === "answer" && now - lastAnswerSentAt < AGENT_STREAM_SEND_INTERVAL_MS) {
+      return sendChain;
+    }
+    if (!force && event === "reasoning" && now - lastReasoningSentAt < AGENT_STREAM_SEND_INTERVAL_MS) {
+      return sendChain;
+    }
+    if (event === "answer") lastAnswerSentAt = now;
+    if (event === "reasoning") lastReasoningSentAt = now;
+
+    const payload = {
+      ...basePayload,
+      event,
+      status: event === "final" ? "done" : event === "error" ? "error" : "streaming",
+      answerText,
+      reasoningText,
+      errorText,
+      updatedAt: now,
+    };
+    const description =
+      event === "final"
+        ? answerText || "智能体回复"
+        : event === "reasoning"
+          ? "智能体正在思考"
+          : "智能体正在回复";
+    sendChain = sendChain.then(async () => {
+      await sendCustomToTarget(client, target, payload, description);
+      const line =
+        `[openim] agent stream custom sent streamID=${streamID} event=${event} ` +
+        `status=${payload.status} answerChars=${answerText.length} reasoningChars=${reasoningText.length}`;
+      if (event === "final" || event === "error" || event === "start") {
+        log?.info?.(line);
+      } else {
+        log?.debug?.(line);
+      }
+    });
+    return sendChain;
+  };
+
+  const ensureStart = () => {
+    if (started) return sendChain;
+    started = true;
+    return enqueue("start", true);
+  };
+
+  return {
+    streamID,
+    async start() {
+      await ensureStart();
+    },
+    async updateReasoning(text: string) {
+      const next = String(text || "");
+      if (!next || next === reasoningText) return;
+      reasoningText = next;
+      await ensureStart();
+      await enqueue("reasoning");
+    },
+    async updateAnswer(text: string) {
+      const next = String(text || "");
+      if (!next || next === answerText) return;
+      answerText = next;
+      await ensureStart();
+      await enqueue("answer");
+    },
+    async final(text?: string) {
+      const next = String(text || answerText || "").trim();
+      if (next) answerText = next;
+      if (!answerText && !reasoningText) return;
+      finalized = true;
+      await ensureStart();
+      await enqueue("final", true);
+      await sendChain;
+    },
+    async error(error: unknown) {
+      finalized = true;
+      await ensureStart();
+      await enqueue("error", true, formatSdkError(error));
+      await sendChain;
+    },
+    hasContent() {
+      return Boolean(answerText || reasoningText);
+    },
+  };
+}
+
 function getConversationIDByInboundMessage(client: OpenIMClientState, msg: MessageItem): string {
   const sessionType = Number(msg.sessionType);
   if (sessionType === SessionType.Group && msg.groupID) {
@@ -502,31 +628,82 @@ export async function processInboundMessage(
     });
   }
 
+  const streamReply = createAgentStreamReplyController(client, msg, api.logger);
+
   try {
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg,
       dispatcherOptions: {
-        deliver: async (payload: { text?: string }) => {
+        deliver: async (payload: { text?: string }, info?: { kind?: string }) => {
           if (!payload.text) return;
           try {
-            await sendReplyFromInbound(client, msg, payload.text);
+            if (info?.kind === "final") {
+              await streamReply.final(payload.text);
+            } else {
+              await streamReply.updateAnswer(payload.text);
+            }
           } catch (e: any) {
             api.logger?.error?.(`[openim] deliver failed: ${formatSdkError(e)}`);
           }
         },
+        onReplyStart: async () => {
+          try {
+            await streamReply.start();
+          } catch (e: any) {
+            api.logger?.warn?.(`[openim] stream start failed: ${formatSdkError(e)}`);
+          }
+        },
         onError: (err: unknown, info: { kind?: string }) => {
           api.logger?.error?.(`[openim] ${info?.kind || "reply"} failed: ${String(err)}`);
+          void streamReply.error(err);
         },
       },
       replyOptions: {
-        disableBlockStreaming: true,
+        disableBlockStreaming: false,
         images: mediaResult.images,
+        onPartialReply: async (payload: { text?: string }) => {
+          if (!payload.text) return;
+          api.logger?.debug?.(
+            `[openim] agent stream partial callback streamID=${streamReply.streamID} chars=${payload.text.length}`
+          );
+          try {
+            await streamReply.updateAnswer(payload.text);
+          } catch (e: any) {
+            api.logger?.warn?.(`[openim] stream answer update failed: ${formatSdkError(e)}`);
+          }
+        },
+        onReasoningStream: async (payload: { text?: string }) => {
+          if (!payload.text) return;
+          api.logger?.debug?.(
+            `[openim] agent stream reasoning callback streamID=${streamReply.streamID} chars=${payload.text.length}`
+          );
+          try {
+            await streamReply.updateReasoning(payload.text);
+          } catch (e: any) {
+            api.logger?.warn?.(`[openim] stream reasoning update failed: ${formatSdkError(e)}`);
+          }
+        },
+        onFinalTextOverride: async (payload: { text?: string }) => {
+          if (!payload.text) return;
+          api.logger?.debug?.(
+            `[openim] agent stream final override streamID=${streamReply.streamID} chars=${payload.text.length}`
+          );
+          try {
+            await streamReply.updateAnswer(payload.text);
+          } catch (e: any) {
+            api.logger?.warn?.(`[openim] stream final override failed: ${formatSdkError(e)}`);
+          }
+        },
       },
     });
+    if (streamReply.hasContent()) {
+      await streamReply.final();
+    }
   } catch (err: any) {
     api.logger?.error?.(`[openim] dispatch failed: ${formatSdkError(err)}`);
     try {
+      await streamReply.error(err);
       const errMsg = formatSdkError(err);
       await sendReplyFromInbound(client, msg, `Processing failed: ${errMsg.slice(0, 80)}`);
     } catch {
