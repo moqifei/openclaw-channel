@@ -101,6 +101,29 @@ export function registerOpenIMTools(api: any): void {
         },
       };
     }
+    // Digital twin accounts (digital_twin:<ownerID>) are scope identifiers for
+    // orange's workspace routing, not real OpenIM SDK connections.  Sending via
+    // them would fall back to the robot's SDK client and produce a message with
+    // the wrong sender identity.  In digital-twin mode the LLM must use
+    // openim_digital_twin_finalize so that chat can send on behalf of the owner.
+    if ((params.accountId ?? "").startsWith("digital_twin:")) {
+      const guidance =
+        "In digital-twin mode you must NOT send messages directly. " +
+        "Use openim_digital_twin_finalize to return your reply text so that " +
+        "the chat service can deliver it with the correct sender identity.";
+      return {
+        ok: false as const,
+        result: {
+          // `content` carries the guidance back to the LLM so it can self-correct
+          // and call openim_digital_twin_finalize instead.
+          content: [{ type: "text", text: guidance }],
+          // `error` makes orange treat this as a tool failure, so the
+          // ToolFailureBreaker suppresses repeated openim_send_* calls and the
+          // agent loop stops wasting turns retrying the blocked send.
+          error: guidance,
+        },
+      };
+    }
     const client = getConnectedClient(params.accountId);
     if (!client) {
       return {
