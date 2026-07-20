@@ -91,7 +91,16 @@ export function registerOpenIMTools(api: any): void {
     },
   });
 
-  const ensureTargetAndClient = (params: { target?: string; accountId?: string }) => {
+  // `toolCtx` is the per-dispatch context the shim injects when it re-invokes a
+  // tool FACTORY at execution time (see openclaw-shim.ts executeTool ->
+  // entry.factory(effectiveCtx)).  For digital-twin dispatches it carries
+  // `digital_twin` (either the boolean `true` or the full task object).  This is
+  // the ONLY reliable place to detect digital-twin mode, because `execute` never
+  // receives the RPC-level `ctx` in its `params` argument.
+  const ensureTargetAndClient = (
+    params: { target?: string; accountId?: string; ctx?: unknown },
+    toolCtx?: { digital_twin?: unknown }
+  ) => {
     const target = parseTarget(params.target);
     if (!target) {
       return {
@@ -103,10 +112,38 @@ export function registerOpenIMTools(api: any): void {
     }
     // Digital twin accounts (digital_twin:<ownerID>) are scope identifiers for
     // orange's workspace routing, not real OpenIM SDK connections.  Sending via
-    // them would fall back to the robot's SDK client and produce a message with
-    // the wrong sender identity.  In digital-twin mode the LLM must use
-    // openim_digital_twin_finalize so that chat can send on behalf of the owner.
-    if ((params.accountId ?? "").startsWith("digital_twin:")) {
+    // them falls back to the robot's default SDK client and produces a message
+    // with the wrong sender identity AND without the digital-twin `Ex` marker,
+    // which then makes the recipient's agent bot auto-reply and loop.
+    //
+    // In digital-twin mode the LLM must use openim_digital_twin_finalize so that
+    // chat can deliver the reply on behalf of the owner (stamping the `Ex`
+    // marker).  We detect the mode from three independent signals so the guard
+    // fires even when the LLM omits `accountId`:
+    //   1. explicit accountId prefix `digital_twin:` (if the LLM passed it)
+    //   2. `params.ctx.digital_twin` (if a future bridge injects ctx into params)
+    //   3. `toolCtx.digital_twin` (the factory-injected dispatch ctx — the path
+    //      that actually works today)
+    const ctxFromParams = (params.ctx ?? (params as Record<string, unknown>).ctx) as
+      | { digital_twin?: unknown }
+      | undefined;
+    const inDigitalTwinMode =
+      (params.accountId ?? "").startsWith("digital_twin:") ||
+      Boolean(ctxFromParams?.digital_twin) ||
+      Boolean(toolCtx?.digital_twin);
+    // === DIAGNOSTIC (digital-twin send guard) ===
+    // Reveal exactly which signal fired (or none) so we can confirm in
+    // production whether the guard blocks direct sends inside a twin session.
+    api.logger?.info?.(
+      `[openim] send-guard diag: tool=${typeof (params as { target?: string }).target !== "undefined" ? "openim_send" : "openim_send"} ` +
+        `accountId=${params.accountId ?? "<none>"} ` +
+        `accountIdIsTwin=${(params.accountId ?? "").startsWith("digital_twin:")} ` +
+        `paramsCtxTwin=${Boolean(ctxFromParams?.digital_twin)} ` +
+        `toolCtxTwin=${Boolean(toolCtx?.digital_twin)} ` +
+        `inDigitalTwinMode=${inDigitalTwinMode}`
+    );
+    // === END DIAGNOSTIC ===
+    if (inDigitalTwinMode) {
       const guidance =
         "In digital-twin mode you must NOT send messages directly. " +
         "Use openim_digital_twin_finalize to return your reply text so that " +
@@ -136,7 +173,14 @@ export function registerOpenIMTools(api: any): void {
     return { ok: true as const, target, client };
   };
 
-  api.registerTool({
+  // NOTE: the send tools are registered as FACTORIES `(toolCtx) => toolDef`.
+  // The openclaw shim re-invokes the factory at execution time with the real
+  // per-dispatch context (`entry.factory(effectiveCtx)`), which is the only way
+  // for these tools to see `digital_twin` and block direct sends.  Registering
+  // them as plain objects (as before) would drop the ctx and let the guard slip.
+  type SendToolCtx = { digital_twin?: unknown };
+
+  api.registerTool((toolCtx: SendToolCtx) => ({
     name: "openim_send_text",
     description: "Send a text message via OpenIM. target format: user:ID or group:ID.",
     parameters: {
@@ -149,7 +193,7 @@ export function registerOpenIMTools(api: any): void {
       required: ["target", "text"],
     },
     async execute(_id: string, params: { target: string; text: string; accountId?: string }) {
-      const checked = ensureTargetAndClient(params);
+      const checked = ensureTargetAndClient(params, toolCtx);
       if (!checked.ok) return checked.result;
       try {
         await sendTextToTarget(checked.client, checked.target, params.text);
@@ -158,9 +202,9 @@ export function registerOpenIMTools(api: any): void {
         return { content: [{ type: "text", text: `Send failed: ${formatSdkError(e)}` }] };
       }
     },
-  });
+  }));
 
-  api.registerTool({
+  api.registerTool((toolCtx: SendToolCtx) => ({
     name: "openim_send_image",
     description: "Send an image via OpenIM. `image` supports a local path or an http(s) URL.",
     parameters: {
@@ -173,7 +217,7 @@ export function registerOpenIMTools(api: any): void {
       required: ["target", "image"],
     },
     async execute(_id: string, params: { target: string; image: string; accountId?: string }) {
-      const checked = ensureTargetAndClient(params);
+      const checked = ensureTargetAndClient(params, toolCtx);
       if (!checked.ok) return checked.result;
       try {
         await sendImageToTarget(checked.client, checked.target, params.image);
@@ -182,9 +226,9 @@ export function registerOpenIMTools(api: any): void {
         return { content: [{ type: "text", text: `Send failed: ${formatSdkError(e)}` }] };
       }
     },
-  });
+  }));
 
-  api.registerTool({
+  api.registerTool((toolCtx: SendToolCtx) => ({
     name: "openim_send_video",
     description: "Send a video via OpenIM (delivered as a file message). `video` supports a local path or URL.",
     parameters: {
@@ -198,7 +242,7 @@ export function registerOpenIMTools(api: any): void {
       required: ["target", "video"],
     },
     async execute(_id: string, params: { target: string; video: string; name?: string; accountId?: string }) {
-      const checked = ensureTargetAndClient(params);
+      const checked = ensureTargetAndClient(params, toolCtx);
       if (!checked.ok) return checked.result;
       try {
         await sendVideoToTarget(checked.client, checked.target, params.video, params.name);
@@ -207,9 +251,9 @@ export function registerOpenIMTools(api: any): void {
         return { content: [{ type: "text", text: `Send failed: ${formatSdkError(e)}` }] };
       }
     },
-  });
+  }));
 
-  api.registerTool({
+  api.registerTool((toolCtx: SendToolCtx) => ({
     name: "openim_send_file",
     description: "Send a file via OpenIM. `file` supports a local path or URL; `name` is optional.",
     parameters: {
@@ -223,7 +267,7 @@ export function registerOpenIMTools(api: any): void {
       required: ["target", "file"],
     },
     async execute(_id: string, params: { target: string; file: string; name?: string; accountId?: string }) {
-      const checked = ensureTargetAndClient(params);
+      const checked = ensureTargetAndClient(params, toolCtx);
       if (!checked.ok) return checked.result;
       try {
         await sendFileToTarget(checked.client, checked.target, params.file, params.name);
@@ -232,5 +276,5 @@ export function registerOpenIMTools(api: any): void {
         return { content: [{ type: "text", text: `Send failed: ${formatSdkError(e)}` }] };
       }
     },
-  });
+  }));
 }
