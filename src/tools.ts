@@ -68,6 +68,18 @@ export function registerOpenIMTools(api: any): void {
         senderUserID: { type: "string", description: "Original sender OpenIM user ID" },
         replyText: { type: "string", description: "Generated reply text" },
         source: { type: "string", description: "Reply generation source" },
+        citations: {
+          type: "array",
+          description: "Knowledge base citation sources (forwarded from Orange for display)",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              spaceName: { type: "string" },
+              relevanceScore: { type: "number" },
+            },
+          },
+        },
         serverMsgID: { type: "string", description: "OpenIM server message ID" },
         clientMsgID: { type: "string", description: "OpenIM client message ID" },
         operationID: { type: "string", description: "OpenIM operation ID" },

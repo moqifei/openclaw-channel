@@ -27,6 +27,12 @@ export interface NormalizedOpenIMDigitalTwinTask extends OpenIMDigitalTwinTask {
   workspaceScope: "digital_twin_owner";
 }
 
+export interface KnowledgeCitation {
+  title: string;
+  spaceName: string;
+  relevanceScore: number;
+}
+
 export interface OpenIMDigitalTwinReply {
   ownerUserID: string;
   senderUserID: string;
@@ -35,6 +41,7 @@ export interface OpenIMDigitalTwinReply {
   serverMsgID?: string;
   clientMsgID?: string;
   operationID?: string;
+  citations?: KnowledgeCitation[];
 }
 
 export interface NormalizedOpenIMDigitalTwinReply extends OpenIMDigitalTwinReply {
@@ -119,6 +126,7 @@ export function normalizeOpenIMDigitalTwinReply(reply: OpenIMDigitalTwinReply): 
     senderUserID,
     replyText,
     source,
+    citations: reply.citations,
     serverMsgID: String(reply.serverMsgID ?? "").trim(),
     clientMsgID: String(reply.clientMsgID ?? "").trim(),
     operationID: String(reply.operationID ?? "").trim(),
