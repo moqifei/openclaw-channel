@@ -6,6 +6,7 @@ import {
   type OpenIMDigitalTwinReply,
   type OpenIMDigitalTwinTask,
 } from "./digital-twin";
+import { getOpenIMUserInfoCache, resolveOpenIMUserInfo } from "./user";
 import { sendFileToTarget, sendImageToTarget, sendTextToTarget, sendVideoToTarget } from "./media";
 import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
@@ -33,7 +34,38 @@ export function registerOpenIMTools(api: any): void {
     },
     async execute(_id: string, params: OpenIMDigitalTwinTask) {
       try {
-        const task = normalizeOpenIMDigitalTwinTask(params);
+        // Resolve the real gateway username from the OpenIM user info cache so that
+        // KB gateway calls use the user's real account (e.g. testuser) instead of the
+        // numeric OpenIM user ID. Mirrors http-token-injector's username resolution.
+        //
+        // NOTE: the cache is only populated for the inbound *sender* in inbound.ts.
+        // The digital-twin *owner* is a different user ID and is never pre-resolved
+        // there, so if it's missing from the cache we resolve it on demand (async)
+        // instead of falling back to the numeric ID / empty string.
+        const ownerID = String(params.ownerUserID ?? "").replace(/^openim:/i, "").trim();
+        let userInfo = ownerID ? getOpenIMUserInfoCache().get(ownerID) : undefined;
+        if (ownerID && !userInfo) {
+          try {
+            const client = getConnectedClient((params as any).accountId);
+            if (client) {
+              userInfo = await resolveOpenIMUserInfo({
+                client,
+                userID: ownerID,
+                fallbackName: String(params.ownerUserID ?? ""),
+                log: (line) => api.logger?.warn?.(String(line)),
+              });
+            }
+          } catch (err) {
+            api.logger?.warn?.(`[openim] resolve owner user info failed for ${ownerID}: ${String(err)}`);
+          }
+        }
+        const resolvedUsername = userInfo?.username
+          ? userInfo.username
+          : (params.username ?? "");
+        api.logger?.info?.(
+          `[openim] digital-twin prepare: ownerID=${ownerID} resolvedUsername=${resolvedUsername} cacheHit=${Boolean(userInfo)}`
+        );
+        const task = normalizeOpenIMDigitalTwinTask({ ...params, username: resolvedUsername });
         return {
           ok: true,
           protocol: "openim_digital_twin_http_task",

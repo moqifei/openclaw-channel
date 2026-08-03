@@ -17,6 +17,8 @@ export interface OpenIMDigitalTwinTask {
   serverMsgID?: string;
   clientMsgID?: string;
   operationID?: string;
+  /** Real gateway username (e.g. testuser), resolved from OpenIM user info cache. */
+  username?: string;
 }
 
 export interface NormalizedOpenIMDigitalTwinTask extends OpenIMDigitalTwinTask {
@@ -25,6 +27,8 @@ export interface NormalizedOpenIMDigitalTwinTask extends OpenIMDigitalTwinTask {
   agentId: string;
   target: string;
   workspaceScope: "digital_twin_owner";
+  /** Real gateway username, if resolved. */
+  username?: string;
 }
 
 export interface KnowledgeCitation {
@@ -92,6 +96,7 @@ export function normalizeOpenIMDigitalTwinTask(task: OpenIMDigitalTwinTask): Nor
     serverMsgID: String(task.serverMsgID ?? "").trim(),
     clientMsgID: String(task.clientMsgID ?? "").trim(),
     operationID: String(task.operationID ?? "").trim(),
+    username: task.username,
     channel: OpenIMDigitalTwinProtocol.channel,
     accountId: digitalTwinAccountId(ownerUserID),
     agentId: digitalTwinAgentId(ownerUserID),
