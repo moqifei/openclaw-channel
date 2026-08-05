@@ -98,7 +98,7 @@ export function registerOpenIMTools(api: any): void {
       properties: {
         ownerUserID: { type: "string", description: "Digital twin owner OpenIM user ID" },
         senderUserID: { type: "string", description: "Original sender OpenIM user ID" },
-        replyText: { type: "string", description: "Generated reply text" },
+        replyText: { type: "string", description: "The complete reply body text to send back to the sender. MUST be the full first-person response content (what you would say directly to the user), NOT a summary like 'I have replied about...' or any meta-description of your action." },
         source: { type: "string", description: "Reply generation source" },
         citations: {
           type: "array",

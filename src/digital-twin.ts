@@ -125,6 +125,29 @@ export function normalizeOpenIMDigitalTwinReply(reply: OpenIMDigitalTwinReply): 
   if (!senderUserID) throw new Error("senderUserID is required");
   if (!replyText) throw new Error("replyText is required");
 
+  // 编码层硬兜底：当本次回复带知识库引用（citations）时，最终回复正文必须真正
+  // 引用到其中至少一条——否则视为模型用「汇报式摘要/空话」搪塞，直接拒绝并让模型重试。
+  // 避免弱模型把知识库内容压缩成「已为你查询知识库」这类不引用具体条目的回复。
+  const citationTitles = Array.isArray(reply.citations)
+    ? reply.citations.map((c) => String(c?.title ?? "").trim()).filter(Boolean)
+    : [];
+  if (citationTitles.length > 0) {
+    const hit = citationTitles.some((title) => {
+      // 取标题核心片段（去空白/标点后前若干字符）做宽松包含匹配，容忍模型轻微改写。
+      const core = title.replace(/[\s\p{P}\p{S}]/gu, "");
+      if (core.length <= 2) return replyText.includes(title);
+      const probe = core.slice(0, Math.min(8, core.length));
+      const normalizedText = replyText.replace(/[\s\p{P}\p{S}]/gu, "");
+      return normalizedText.includes(probe);
+    });
+    if (!hit) {
+      throw new Error(
+        "replyText 未引用任何知识库条目：检测到回复正文没有包含 citations 中的知识库标题/内容，" +
+          "而是用了「汇报式摘要」或空话。请基于知识库整理稿，把相关条目（标题与要点）写进回复后再调用 finalize 返回。"
+      );
+    }
+  }
+
   const source = String(reply.source ?? "orange_dispatcher").trim() || "orange_dispatcher";
   const normalized: NormalizedOpenIMDigitalTwinReply = {
     ownerUserID,
