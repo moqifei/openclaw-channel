@@ -17,6 +17,8 @@ export interface OpenIMAccountConfig {
   requireMention: boolean;
   processOfflineMessages: boolean;
   inboundWhitelist: string[];
+  /** 可选：覆盖静默假死存活检测阈值（毫秒），默认 180000（3 分钟）。 */
+  livenessTimeoutMs?: number;
 }
 
 export interface OpenIMClientState {
@@ -24,6 +26,10 @@ export interface OpenIMClientState {
   config: OpenIMAccountConfig;
   messageAcceptAfterMs: number;
   replayFilterUntilMs: number;
+  /** 最近一次收到消息（或连接成功）的时间戳，用于静默假死存活检测。 */
+  lastMessageSeenMs: number;
+  /** 存活检测定时器；超过 LIVENESS_TIMEOUT_MS 未收到消息则主动重连。 */
+  livenessTimer?: ReturnType<typeof setInterval>;
   handlers: {
     onRecvNewMessage: (event: CallbackEvent<MessageItem>) => void;
     onRecvNewMessages: (event: CallbackEvent<MessageItem[]>) => void;

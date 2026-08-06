@@ -3,6 +3,11 @@ import { processInboundMessage, type InboundMessageSource } from "./inbound";
 import { resolveAccountToken } from "./token";
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
 import { formatSdkError } from "./utils";
+import {
+  LIVENESS_CHECK_INTERVAL_MS,
+  resolveLivenessTimeoutMs,
+  shouldForceReconnect,
+} from "./liveness";
 
 const clients = new Map<string, OpenIMClientState>();
 const MESSAGE_ACCEPT_GRACE_MS = 5 * 60_000;
@@ -41,6 +46,35 @@ function scheduleReconnect(api: any, state: OpenIMClientState, reason: string): 
       scheduleReconnect(api, state, "reconnect failed");
     });
   }, delayMs);
+}
+
+/**
+ * 启动静默假死存活检测。
+ * 每隔 LIVENESS_CHECK_INTERVAL_MS 检查一次 lastMessageSeenMs，若超过阈值未收到任何消息，
+ * 说明 SDK 长连接已静默失效（收不到消息也不回调 onConnectFailed），主动触发重连。
+ */
+function startLivenessMonitor(api: any, state: OpenIMClientState): void {
+  stopLivenessMonitor(state);
+  const timeoutMs = resolveLivenessTimeoutMs(state.config);
+  state.livenessTimer = setInterval(() => {
+    if (shouldForceReconnect(state, Date.now(), timeoutMs)) {
+      const idleMs = Date.now() - state.lastMessageSeenMs;
+      api.logger?.warn?.(
+        `[openim] account ${state.config.accountId} stale connection detected ` +
+          `(no message for ${Math.round(idleMs / 1000)}s >= ${Math.round(timeoutMs / 1000)}s), forcing reconnect`
+      );
+      scheduleReconnect(api, state, "stale connection");
+    }
+  }, LIVENESS_CHECK_INTERVAL_MS);
+  // 不阻止进程退出：存活检测定时器不应保持事件循环常驻。
+  if (typeof state.livenessTimer.unref === "function") state.livenessTimer.unref();
+}
+
+function stopLivenessMonitor(state: OpenIMClientState): void {
+  if (state.livenessTimer) {
+    clearInterval(state.livenessTimer);
+    state.livenessTimer = undefined;
+  }
 }
 
 async function reconnectAccount(api: any, state: OpenIMClientState, reason: string): Promise<void> {
@@ -99,6 +133,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       config: resolvedConfig,
       messageAcceptAfterMs: Date.now() - MESSAGE_ACCEPT_GRACE_MS,
       replayFilterUntilMs: Date.now() + MESSAGE_REPLAY_FILTER_WINDOW_MS,
+      lastMessageSeenMs: Date.now(),
       handlers: {
         onRecvNewMessage: () => undefined,
         onRecvNewMessages: () => undefined,
@@ -112,6 +147,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
     } as OpenIMClientState;
 
     const consumeMessage = (msg: MessageItem, source: InboundMessageSource) => {
+      (state as OpenIMClientState).lastMessageSeenMs = Date.now();
       processInboundMessage(api, state as OpenIMClientState, msg, source).catch((e: any) => {
         api.logger?.error?.(`[openim] processInboundMessage failed: ${formatSdkError(e)}`);
       });
@@ -145,7 +181,9 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       scheduleReconnect(api, state as OpenIMClientState, "connect failed");
     };
     state.handlers.onConnectSuccess = () => {
-      if (state?.reconnect) state.reconnect.attempts = 0;
+      if (!state) return;
+      if (state.reconnect) state.reconnect.attempts = 0;
+      state.lastMessageSeenMs = Date.now();
       api.logger?.info?.(`[openim] account ${config.accountId} connection healthy`);
     };
 
@@ -167,6 +205,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       platformID: config.platformID,
     });
     clients.set(config.accountId, state);
+    startLivenessMonitor(api, state as OpenIMClientState);
     api.logger?.info?.(`[openim] account ${config.accountId} connected`);
   } catch (e: any) {
     if (state) detachHandlers(state);
@@ -184,6 +223,7 @@ export async function stopAllClients(api: any): Promise<void> {
       if (state.reconnect.timer) clearTimeout(state.reconnect.timer);
       state.reconnect.timer = undefined;
     }
+    stopLivenessMonitor(state);
     detachHandlers(state);
     try {
       await state.sdk.logout();
