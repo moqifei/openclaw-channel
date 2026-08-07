@@ -5,7 +5,10 @@ import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
 import { formatSdkError } from "./utils";
 import {
   LIVENESS_CHECK_INTERVAL_MS,
+  clearStdoutBroken,
   resolveLivenessTimeoutMs,
+  resolveSendLivenessTimeoutMs,
+  scheduleStdoutBrokenExit,
   shouldForceReconnect,
 } from "./liveness";
 
@@ -55,19 +58,50 @@ function scheduleReconnect(api: any, state: OpenIMClientState, reason: string): 
  */
 function startLivenessMonitor(api: any, state: OpenIMClientState): void {
   stopLivenessMonitor(state);
-  const timeoutMs = resolveLivenessTimeoutMs(state.config);
+  const recvTimeoutMs = resolveLivenessTimeoutMs(state.config);
+  const sendTimeoutMs = resolveSendLivenessTimeoutMs(state.config);
   state.livenessTimer = setInterval(() => {
-    if (shouldForceReconnect(state, Date.now(), timeoutMs)) {
-      const idleMs = Date.now() - state.lastMessageSeenMs;
-      api.logger?.warn?.(
-        `[openim] account ${state.config.accountId} stale connection detected ` +
-          `(no message for ${Math.round(idleMs / 1000)}s >= ${Math.round(timeoutMs / 1000)}s), forcing reconnect`
-      );
-      scheduleReconnect(api, state, "stale connection");
+    if (shouldForceReconnect(state, Date.now(), recvTimeoutMs, sendTimeoutMs)) {
+      const reason = describeLivenessReason(state, Date.now(), recvTimeoutMs, sendTimeoutMs);
+      api.logger?.warn?.(`[openim] account ${state.config.accountId} ${reason}, forcing reconnect`);
+
+      if (state.stdoutBroken) {
+        // 管道已断裂：仅靠 IM SDK 重连无法恢复与 orange 的 stdio 通道，
+        // 主动退出由 orange 重新拉起本插件，重建 stdin/stdout 控制通道。
+        api.logger?.error?.(
+          `[openim] account ${state.config.accountId} stdio pipe to orange broken, exiting to force respawn`
+        );
+        scheduleStdoutBrokenExit(state);
+      } else {
+        scheduleReconnect(api, state, "stale connection");
+      }
     }
   }, LIVENESS_CHECK_INTERVAL_MS);
   // 不阻止进程退出：存活检测定时器不应保持事件循环常驻。
   if (typeof state.livenessTimer.unref === "function") state.livenessTimer.unref();
+}
+
+/** 生成存活检测的触发原因描述，便于日志区分收侧/发侧/管道断裂。 */
+function describeLivenessReason(
+  state: OpenIMClientState,
+  now: number,
+  recvTimeoutMs: number,
+  sendTimeoutMs: number
+): string {
+  if (state.stdoutBroken) {
+    return `stdio pipe to orange broken (detected at ${state.lastStdoutErrorMs})`;
+  }
+  const recvIdleMs = now - state.lastMessageSeenMs;
+  if (recvIdleMs >= recvTimeoutMs) {
+    return `no inbound message for ${Math.round(recvIdleMs / 1000)}s >= ${Math.round(recvTimeoutMs / 1000)}s`;
+  }
+  if (typeof sendTimeoutMs === "number" && typeof state.lastFlushMs === "number") {
+    const sendIdleMs = now - state.lastFlushMs;
+    if (sendIdleMs >= sendTimeoutMs) {
+      return `no successful flush to orange for ${Math.round(sendIdleMs / 1000)}s >= ${Math.round(sendTimeoutMs / 1000)}s`;
+    }
+  }
+  return "stale connection";
 }
 
 function stopLivenessMonitor(state: OpenIMClientState): void {
@@ -101,6 +135,7 @@ async function reconnectAccount(api: any, state: OpenIMClientState, reason: stri
       platformID: state.config.platformID,
     });
     reconnect.attempts = 0;
+    clearStdoutBroken(state);
     api.logger?.info?.(`[openim] account ${state.config.accountId} reconnected`);
   } finally {
     reconnect.running = false;
@@ -119,6 +154,16 @@ export function getConnectedClient(accountId?: string): OpenIMClientState | null
 
 export function connectedClientCount(): number {
   return clients.size;
+}
+
+/** 仅供单元测试注入客户端状态，便于验证 outbound 写回时的存活标记逻辑。 */
+export function __setTestClient(accountId: string, state: OpenIMClientState): void {
+  clients.set(accountId, state);
+}
+
+/** 仅供单元测试：清空所有已注册客户端。 */
+export function __clearTestClients(): void {
+  clients.clear();
 }
 
 export async function startAccountClient(api: any, config: OpenIMAccountConfig): Promise<void> {
@@ -184,6 +229,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       if (!state) return;
       if (state.reconnect) state.reconnect.attempts = 0;
       state.lastMessageSeenMs = Date.now();
+      clearStdoutBroken(state as OpenIMClientState);
       api.logger?.info?.(`[openim] account ${config.accountId} connection healthy`);
     };
 

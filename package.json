@@ -40,6 +40,7 @@
   },
   "scripts": {
     "build": "tsdown",
+    "test": "OPENIM_DISABLE_STDOUT_EXIT=1 tsx --test src/channel.test.ts && tsx --test src/liveness.test.ts",
     "test:connect": "tsx scripts/test-connect.ts",
     "prepublishOnly": "npm run build"
   },

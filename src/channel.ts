@@ -4,6 +4,7 @@ import { OpenIMDigitalTwinProtocol } from "./digital-twin";
 import { sendTextToTarget } from "./media";
 import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
+import { isPipeBrokenError, markStdoutBroken, scheduleStdoutBrokenExit, updateLastFlush } from "./liveness";
 
 export const OpenIMChannelPlugin = {
   id: "openim",
@@ -43,8 +44,16 @@ export const OpenIMChannelPlugin = {
       }
       try {
         await sendTextToTarget(client, target, text);
+        // 反向存活探测：成功写回对端（orange）即更新发侧健康时间戳。
+        updateLastFlush(client, Date.now());
         return { ok: true, provider: "openim" };
       } catch (e: any) {
+        // 反向存活探测：投递失败若是对端管道断裂（EPIPE），立即标记，
+        // 并主动退出由 orange 重新拉起本插件，重建 stdin/stdout 通道。
+        if (isPipeBrokenError(e)) {
+          markStdoutBroken(client, Date.now());
+          scheduleStdoutBrokenExit(client);
+        }
         return { ok: false, error: new Error(formatSdkError(e)) };
       }
     },
