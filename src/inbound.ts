@@ -423,14 +423,19 @@ function createAgentStreamReplyController(
           ? "智能体正在思考"
           : "智能体正在回复";
     sendChain = sendChain.then(async () => {
-      await sendCustomToTarget(client, target, payload, description);
-      const line =
-        `[openim] agent stream custom sent streamID=${streamID} event=${event} ` +
-        `status=${payload.status} answerChars=${answerText.length} reasoningChars=${reasoningText.length}`;
-      if (event === "final" || event === "error" || event === "start") {
-        log?.info?.(line);
-      } else {
-        log?.debug?.(line);
+      try {
+        await sendCustomToTarget(client, target, payload, description);
+        const line =
+          `[openim] agent stream custom sent streamID=${streamID} event=${event} ` +
+          `status=${payload.status} answerChars=${answerText.length} reasoningChars=${reasoningText.length}`;
+        if (event === "final" || event === "error" || event === "start") {
+          log?.info?.(line);
+        } else {
+          log?.debug?.(line);
+        }
+      } catch (e: any) {
+        log?.warn?.(`[openim][reply] agent stream custom FAILED streamID=${streamID} event=${event} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`);
+        throw e;
       }
     });
     return sendChain;
@@ -464,17 +469,29 @@ function createAgentStreamReplyController(
     async final(text?: string) {
       const next = String(text || answerText || "").trim();
       if (next) answerText = next;
-      if (!answerText && !reasoningText) return;
+      if (!answerText && !reasoningText) {
+        log?.warn?.(`[openim][reply] stream final skipped: empty content streamID=${streamID} target=${target.kind}:${target.id}`);
+        return;
+      }
       finalized = true;
       await ensureStart();
       await enqueue("final", true);
-      await sendChain;
+      try {
+        await sendChain;
+        log?.info?.(`[openim][reply] stream finalized OK streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} answerChars=${answerText.length}`);
+      } catch (e: any) {
+        log?.warn?.(`[openim][reply] stream final FAILED streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`);
+      }
     },
     async error(error: unknown) {
       finalized = true;
       await ensureStart();
       await enqueue("error", true, formatSdkError(error));
-      await sendChain;
+      try {
+        await sendChain;
+      } catch (e: any) {
+        log?.warn?.(`[openim][reply] stream error FAILED streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`);
+      }
     },
     hasContent() {
       return Boolean(answerText || reasoningText);
@@ -706,6 +723,18 @@ export async function processInboundMessage(
   }
 
   const streamReply = createAgentStreamReplyController(client, msg, api.logger);
+
+  const now = Date.now();
+  const recvIdleMs = client.lastMessageSeenMs ? now - client.lastMessageSeenMs : -1;
+  const sendIdleMs = typeof client.lastFlushMs === "number" ? now - client.lastFlushMs : -1;
+  api.logger?.info?.(
+    `[openim][flow] inbound dispatch begin: ` +
+      `client=${client.config.accountId} userID=${client.config.userID} ` +
+      `from=${msg.sendID} sessionType=${msg.sessionType} groupID=${msg.groupID || "<none>"} ` +
+      `clientMsgID=${msg.clientMsgID || "<none>"} serverMsgID=${msg.serverMsgID || "<none>"} ` +
+      `messageLen=${(msg.textElem?.content ?? "").length} ` +
+      `health{recvIdleMs=${recvIdleMs} sendIdleMs=${sendIdleMs} stdoutBroken=${!!client.stdoutBroken} reconnectRunning=${client.reconnect?.running ?? false}}`
+  );
 
   try {
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({

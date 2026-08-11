@@ -6,6 +6,9 @@ import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
 import { isPipeBrokenError, markStdoutBroken, scheduleStdoutBrokenExit, updateLastFlush } from "./liveness";
 
+/** 模块级 logger，由 gateway.startAccount 注册，供 outbound 等无 logger 句柄的入口使用。 */
+let channelLogger: any = undefined;
+
 export const OpenIMChannelPlugin = {
   id: "openim",
   meta: {
@@ -40,14 +43,17 @@ export const OpenIMChannelPlugin = {
       }
       const client = getConnectedClient(accountId);
       if (!client) {
+        channelLogger?.warn?.(`[openim] outbound.sendText: OpenIM not connected (account=${accountId ?? "<none>"}, to=${to})`);
         return { ok: false, error: new Error("OpenIM not connected") };
       }
       try {
         await sendTextToTarget(client, target, text);
         // 反向存活探测：成功写回对端（orange）即更新发侧健康时间戳。
         updateLastFlush(client, Date.now());
+        (client as any).logger?.info?.(`[openim] outbound.sendText OK: to=${to} textChars=${text.length}`);
         return { ok: true, provider: "openim" };
       } catch (e: any) {
+        (client as any).logger?.warn?.(`[openim] outbound.sendText FAILED: to=${to} error=${formatSdkError(e)}`);
         // 反向存活探测：投递失败若是对端管道断裂（EPIPE），立即标记，
         // 并主动退出由 orange 重新拉起本插件，重建 stdin/stdout 通道。
         if (isPipeBrokenError(e)) {
@@ -60,6 +66,7 @@ export const OpenIMChannelPlugin = {
   },
   gateway: {
     startAccount: async (ctx: any) => {
+      channelLogger = ctx?.log;
       const account = getOpenIMAccountConfig(ctx, ctx.accountId);
       if (!account) {
         ctx.log?.error?.(`[openim] no account config found for ${ctx.accountId}`);

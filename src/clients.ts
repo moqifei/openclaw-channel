@@ -6,15 +6,30 @@ import { formatSdkError } from "./utils";
 import {
   LIVENESS_CHECK_INTERVAL_MS,
   clearStdoutBroken,
+  markStdoutBroken,
   resolveLivenessTimeoutMs,
   resolveSendLivenessTimeoutMs,
   scheduleStdoutBrokenExit,
   shouldForceReconnect,
 } from "./liveness";
+import { registerSendFailureHandler } from "./media";
 
 const clients = new Map<string, OpenIMClientState>();
 const MESSAGE_ACCEPT_GRACE_MS = 5 * 60_000;
 const MESSAGE_REPLAY_FILTER_WINDOW_MS = 2 * 60_000;
+
+/**
+ * 发送失败自愈钩子（借鉴 orange wechat channel 的传输层重试 + 主动重建思路）：
+ * media.ts 在 sendMessage 重试耗尽后回调此钩子，主动标记 stdout 断裂并触发重连，
+ * 让"偶发已读不回"立即自愈，而非被动等待 180s 存活检测或重启 orange。
+ */
+registerSendFailureHandler((accountId: string) => {
+  const state = clients.get(accountId);
+  if (!state) return;
+  // 复用 liveness 的 stdout 断裂标记与重连调度（stdoutBroken 会驱动强制重连/退出重建）。
+  markStdoutBroken(state, Date.now());
+  scheduleReconnect(undefined as any, state, "send failure after retries");
+});
 
 function markMessageAcceptWindow(state: OpenIMClientState): void {
   const now = Date.now();
@@ -38,14 +53,16 @@ function scheduleReconnect(api: any, state: OpenIMClientState, reason: string): 
   if (!reconnect || reconnect.stopped) return;
   if (reconnect.timer || reconnect.running) return;
 
+  // 兼容 sender-failure 自愈钩子调用（无 api 句柄时降级用 state.logger）。
+  const log = api?.logger ?? (state as any).logger;
   const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(reconnect.attempts, 5));
   reconnect.attempts += 1;
-  api.logger?.warn?.(`[openim] account ${state.config.accountId} reconnect scheduled in ${delayMs}ms: ${reason}`);
+  log?.warn?.(`[openim] account ${state.config.accountId} reconnect scheduled in ${delayMs}ms: ${reason}`);
 
   reconnect.timer = setTimeout(() => {
     reconnect.timer = undefined;
     reconnectAccount(api, state, reason).catch((e: any) => {
-      api.logger?.error?.(`[openim] account ${state.config.accountId} reconnect failed: ${formatSdkError(e)}`);
+      log?.error?.(`[openim] account ${state.config.accountId} reconnect failed: ${formatSdkError(e)}`);
       scheduleReconnect(api, state, "reconnect failed");
     });
   }, delayMs);
@@ -61,8 +78,19 @@ function startLivenessMonitor(api: any, state: OpenIMClientState): void {
   const recvTimeoutMs = resolveLivenessTimeoutMs(state.config);
   const sendTimeoutMs = resolveSendLivenessTimeoutMs(state.config);
   state.livenessTimer = setInterval(() => {
-    if (shouldForceReconnect(state, Date.now(), recvTimeoutMs, sendTimeoutMs)) {
-      const reason = describeLivenessReason(state, Date.now(), recvTimeoutMs, sendTimeoutMs);
+    const now = Date.now();
+    const recvIdleMs = now - state.lastMessageSeenMs;
+    const sendIdleMs = typeof state.lastFlushMs === "number" ? now - state.lastFlushMs : -1;
+    // 周期性健康快照：偶发"假死但未达阈值"时也能看到空闲时长趋势。
+    api.logger?.debug?.(
+      `[openim][health] account ${state.config.accountId} ` +
+        `recvIdleMs=${recvIdleMs} sendIdleMs=${sendIdleMs} stdoutBroken=${!!state.stdoutBroken} ` +
+        `reconnectRunning=${state.reconnect?.running ?? false} ` +
+        `thresholds{recv=${recvTimeoutMs} send=${sendTimeoutMs}}`
+    );
+
+    if (shouldForceReconnect(state, now, recvTimeoutMs, sendTimeoutMs)) {
+      const reason = describeLivenessReason(state, now, recvTimeoutMs, sendTimeoutMs);
       api.logger?.warn?.(`[openim] account ${state.config.accountId} ${reason}, forcing reconnect`);
 
       if (state.stdoutBroken) {
@@ -116,8 +144,9 @@ async function reconnectAccount(api: any, state: OpenIMClientState, reason: stri
   if (!reconnect || reconnect.stopped || reconnect.running) return;
   reconnect.running = true;
 
+  const log = api?.logger ?? (state as any).logger;
   try {
-    api.logger?.warn?.(`[openim] account ${state.config.accountId} reconnecting: ${reason}`);
+    log?.warn?.(`[openim] account ${state.config.accountId} reconnecting: ${reason}`);
     try {
       await state.sdk.logout();
     } catch {
@@ -136,20 +165,45 @@ async function reconnectAccount(api: any, state: OpenIMClientState, reason: stri
     });
     reconnect.attempts = 0;
     clearStdoutBroken(state);
-    api.logger?.info?.(`[openim] account ${state.config.accountId} reconnected`);
+    log?.info?.(`[openim] account ${state.config.accountId} reconnected`);
   } finally {
     reconnect.running = false;
   }
 }
 
 export function getConnectedClient(accountId?: string): OpenIMClientState | null {
+  let selected: OpenIMClientState | null = null;
+  let selectedKey: string | null = null;
   if (accountId && clients.has(accountId)) {
-    return clients.get(accountId) ?? null;
+    selected = clients.get(accountId) ?? null;
+    selectedKey = accountId;
+  } else if (clients.has("default")) {
+    selected = clients.get("default") ?? null;
+    selectedKey = "default";
+  } else {
+    const first = clients.values().next();
+    if (!first.done) { selected = first.value; selectedKey = "first"; }
   }
-  if (clients.has("default")) return clients.get("default") ?? null;
 
-  const first = clients.values().next();
-  return first.done ? null : first.value;
+  const logger = (selected as any)?.logger;
+  const known = Array.from(clients.keys()).join(",") || "<none>";
+  if (!selected) {
+    logger?.warn?.(`[openim][state] getConnectedClient MISSING: requestedAccount=${accountId ?? "<none>"} knownAccounts=${known}`);
+    return null;
+  }
+  const now = Date.now();
+  const recvIdleMs = selected.lastMessageSeenMs ? now - selected.lastMessageSeenMs : -1;
+  // OpenIMClientState 无显式 connected 字段：用 lastMessageSeenMs 新鲜度 + stdoutBroken 推断状态。
+  const seeminglyHealthy = !selected.stdoutBroken && recvIdleMs >= 0 && recvIdleMs < 600_000;
+  logger?.debug?.(
+    `[openim][state] getConnectedClient: requestedAccount=${accountId ?? "<none>"} selectedKey=${selectedKey} ` +
+      `userID=${selected.config.userID} recvIdleMs=${recvIdleMs} stdoutBroken=${!!selected.stdoutBroken} ` +
+      `reconnectRunning=${selected.reconnect?.running ?? false} seeminglyHealthy=${seeminglyHealthy} knownAccounts=${known}`
+  );
+  if (selected.stdoutBroken) {
+    logger?.warn?.(`[openim][state] getConnectedClient: selected account ${selected.config.accountId} has stdoutBroken=true — replies will fail`);
+  }
+  return selected;
 }
 
 export function connectedClientCount(): number {
