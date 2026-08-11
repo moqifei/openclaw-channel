@@ -139,6 +139,49 @@ function stopLivenessMonitor(state: OpenIMClientState): void {
   }
 }
 
+/**
+ * 重新挂载 SDK 消息/状态监听器。open-im-server 重启后，即使连接恢复，
+ * 旧的会话订阅可能失效；重新调用 sdk.on 可确保监听器绑定到新的会话上下文上。
+ * 设计为可重入：重复调用不会产生重复副作用（SDK 的 on 是覆盖式注册）。
+ */
+function attachHandlers(sdk: any, state: OpenIMClientState): void {
+  sdk.on(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
+  sdk.on(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
+  sdk.on(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
+  sdk.on(CbEvents.OnUserTokenExpired, state.handlers.onUserTokenExpired);
+  sdk.on(CbEvents.OnUserTokenInvalid, state.handlers.onUserTokenInvalid);
+  sdk.on(CbEvents.OnKickedOffline, state.handlers.onKickedOffline);
+  sdk.on(CbEvents.OnConnectFailed, state.handlers.onConnectFailed);
+  sdk.on(CbEvents.OnConnectSuccess, state.handlers.onConnectSuccess);
+}
+
+/**
+ * 重建会话：重新 login + 重新挂载监听器。解决 open-im-server 重启后
+ * "显示在线但不收消息" 的问题——server 重启使旧 WS 会话的消息订阅失效，
+ * 必须重新 login 以重建会话上下文。
+ */
+async function reestablishSession(api: any, state: OpenIMClientState): Promise<void> {
+  const log = api?.logger ?? (state as any).logger;
+  const token = await resolveAccountToken(state.config, { forceRefresh: true }).catch(() => state.config.token ?? "");
+  state.config = { ...state.config, token };
+  markMessageAcceptWindow(state);
+  try {
+    await state.sdk.login({
+      userID: state.config.userID,
+      token,
+      wsAddr: state.config.wsAddr,
+      apiAddr: state.config.apiAddr,
+      platformID: state.config.platformID,
+    });
+  } catch (e: any) {
+    // login 失败不致命：SDK 会自动重连并再次触发 onConnectSuccess，届时重试。
+    log?.warn?.(`[openim] account ${state.config.accountId} re-login attempt failed (will retry on next connect): ${formatSdkError(e)}`);
+  }
+  // 重新挂载监听器，绑定到新会话上下文。
+  attachHandlers(state.sdk, state);
+  log?.info?.(`[openim] account ${state.config.accountId} session re-established (login + handlers reattached)`);
+}
+
 async function reconnectAccount(api: any, state: OpenIMClientState, reason: string): Promise<void> {
   const reconnect = state.reconnect;
   if (!reconnect || reconnect.stopped || reconnect.running) return;
@@ -163,6 +206,8 @@ async function reconnectAccount(api: any, state: OpenIMClientState, reason: stri
       apiAddr: state.config.apiAddr,
       platformID: state.config.platformID,
     });
+    // 重新挂载监听器，绑定到重建后的会话上下文。
+    attachHandlers(state.sdk, state);
     reconnect.attempts = 0;
     clearStdoutBroken(state);
     log?.info?.(`[openim] account ${state.config.accountId} reconnected`);
@@ -281,20 +326,32 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
     };
     state.handlers.onConnectSuccess = () => {
       if (!state) return;
+      const prevSeen = (state as OpenIMClientState).lastMessageSeenMs;
       if (state.reconnect) state.reconnect.attempts = 0;
-      state.lastMessageSeenMs = Date.now();
+      (state as OpenIMClientState).lastMessageSeenMs = Date.now();
       clearStdoutBroken(state as OpenIMClientState);
-      api.logger?.info?.(`[openim] account ${config.accountId} connection healthy`);
+
+      // 关键修复：open-im-server 重启后，OpenIM SDK 的长连接会话上下文会失效，
+      // 即便 onConnectSuccess 触发（显示"在线"），旧会话的消息订阅已失效，导致新消息不再分发。
+      // 因此每次连接成功都强制重新 login 以重建会话订阅，并重新挂载消息监听器，
+      // 确保 server 重启后消息推送能恢复。
+      const firstConnect = prevSeen === undefined || prevSeen <= 0;
+      if (!firstConnect) {
+        api.logger?.warn?.(`[openim] account ${config.accountId} reconnect success after gap, re-login to restore message subscription`);
+        reestablishSession(api, state as OpenIMClientState).catch((e: any) => {
+          api.logger?.error?.(`[openim] account ${config.accountId} re-login failed after reconnect: ${formatSdkError(e)}`);
+          scheduleReconnect(api, state as OpenIMClientState, "re-login failed");
+        });
+      } else {
+        api.logger?.info?.(`[openim] account ${config.accountId} connection healthy`);
+      }
     };
 
-    sdk.on(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
-    sdk.on(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
-    sdk.on(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
-    sdk.on(CbEvents.OnUserTokenExpired, state.handlers.onUserTokenExpired);
-    sdk.on(CbEvents.OnUserTokenInvalid, state.handlers.onUserTokenInvalid);
-    sdk.on(CbEvents.OnKickedOffline, state.handlers.onKickedOffline);
-    sdk.on(CbEvents.OnConnectFailed, state.handlers.onConnectFailed);
-    sdk.on(CbEvents.OnConnectSuccess, state.handlers.onConnectSuccess);
+    attachHandlers(sdk, state as OpenIMClientState);
+    // 保存 detach 能力，供重连后重新注册使用。
+    (state as any).__detachHandlers = () => detachHandlers(state as OpenIMClientState);
+    // 保存当前账号配置引用，供 onConnectSuccess 重新 login 使用。
+    (state as any).__api = api;
 
     markMessageAcceptWindow(state);
     await sdk.login({
