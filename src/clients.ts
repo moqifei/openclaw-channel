@@ -165,6 +165,10 @@ function attachHandlers(sdk: any, state: OpenIMClientState): void {
  * 必须重新 login 以重建会话上下文。
  */
 async function reestablishSession(api: any, state: OpenIMClientState): Promise<void> {
+  const reconnect = state.reconnect;
+  // 与 reconnectAccount 共用互斥，避免两者并发导致双 login 风暴。
+  if (!reconnect || reconnect.stopped || reconnect.running) return;
+  reconnect.running = true;
   const log = api?.logger ?? (state as any).logger;
   const token = await resolveAccountToken(state.config, { forceRefresh: true }).catch(() => state.config.token ?? "");
   state.config = { ...state.config, token };
@@ -180,6 +184,8 @@ async function reestablishSession(api: any, state: OpenIMClientState): Promise<v
   } catch (e: any) {
     // login 失败不致命：SDK 会自动重连并再次触发 onConnectSuccess，届时重试。
     log?.warn?.(`[openim] account ${state.config.accountId} re-login attempt failed (will retry on next connect): ${formatSdkError(e)}`);
+  } finally {
+    if (reconnect) reconnect.running = false;
   }
   // 重新挂载监听器，绑定到新会话上下文。
   attachHandlers(state.sdk, state);
@@ -282,6 +288,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       messageAcceptAfterMs: Date.now() - MESSAGE_ACCEPT_GRACE_MS,
       replayFilterUntilMs: Date.now() + MESSAGE_REPLAY_FILTER_WINDOW_MS,
       lastMessageSeenMs: Date.now(),
+      lastSessionRestoreMs: undefined,
       handlers: {
         onRecvNewMessage: () => undefined,
         onRecvNewMessages: () => undefined,
@@ -330,21 +337,41 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
     };
     state.handlers.onConnectSuccess = () => {
       if (!state) return;
-      const prevSeen = (state as OpenIMClientState).lastMessageSeenMs;
+      const s = state as OpenIMClientState;
+      const prevSeen = s.lastMessageSeenMs;
       if (state.reconnect) state.reconnect.attempts = 0;
-      (state as OpenIMClientState).lastMessageSeenMs = Date.now();
-      clearStdoutBroken(state as OpenIMClientState);
+      s.lastMessageSeenMs = Date.now();
+      clearStdoutBroken(s);
 
-      // 关键修复：open-im-server 重启后，OpenIM SDK 的长连接会话上下文会失效，
-      // 即便 onConnectSuccess 触发（显示"在线"），旧会话的消息订阅已失效，导致新消息不再分发。
-      // 因此每次连接成功都强制重新 login 以重建会话订阅，并重新挂载消息监听器，
-      // 确保 server 重启后消息推送能恢复。
+      // 关键修复（登录风暴收敛）：
+      // open-im-server 重启后，旧 WS 会话的消息订阅会失效，需要重新 login 重建会话。
+      // 但 SDK 每次 login 成功都会回调 onConnectSuccess，若此处无条件再 login，
+      // 会形成 login -> onConnectSuccess -> login ... 的死循环，导致 token 被高频
+      // invalidate（server 侧 DELETE_CACHE_AUTH 暴涨）进而 OOM。
+      //
+      // 防御要点：
+      //   1. 首次连接不触发（SDK 自带完整会话）。
+      //   2. 仅当存在连接"断连间隔"（非首次）且本次不是由 reconnectAccount 主动
+      //      重连引起的（reconnect.running 为 false，即 SDK 自己静默重连）时，才
+      //      触发一次 reestablishSession；reconnectAccount 自己已做 logout+login，
+      //      无需重复。
+      //   3. 用 lastSessionRestoreMs 去重：reestablishSession 内的 login 会再次触发
+      //      onConnectSuccess，必须保证同一断连窗口内只恢复一次，彻底切断死循环。
       const firstConnect = prevSeen === undefined || prevSeen <= 0;
-      if (!firstConnect) {
-        api.logger?.warn?.(`[openim] account ${config.accountId} reconnect success after gap, re-login to restore message subscription`);
-        reestablishSession(api, state as OpenIMClientState).catch((e: any) => {
+      const now = Date.now();
+      const recentlyRestored = s.lastSessionRestoreMs && (now - s.lastSessionRestoreMs) < 30_000;
+      const needsRestore =
+        !firstConnect &&
+        state.reconnect &&
+        !state.reconnect.running &&
+        !state.reconnect.stopped &&
+        !recentlyRestored;
+      if (needsRestore) {
+        s.lastSessionRestoreMs = now;
+        api.logger?.warn?.(`[openim] account ${config.accountId} silent reconnect detected, re-login to restore message subscription`);
+        reestablishSession(api, s).catch((e: any) => {
           api.logger?.error?.(`[openim] account ${config.accountId} re-login failed after reconnect: ${formatSdkError(e)}`);
-          scheduleReconnect(api, state as OpenIMClientState, "re-login failed");
+          scheduleReconnect(api, s, "re-login failed");
         });
       } else {
         api.logger?.info?.(`[openim] account ${config.accountId} connection healthy`);

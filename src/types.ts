@@ -31,6 +31,12 @@ export interface OpenIMClientState {
   /** 最近一次收到消息（或连接成功）的时间戳，用于静默假死存活检测。 */
   lastMessageSeenMs: number;
   /**
+   * 最近一次通过 reestablishSession 恢复会话的时间戳（去重用）。
+   * onConnectSuccess 由每次 login 成功触发，reestablishSession 内部的 login 也会回调它；
+   * 用该字段保证同一断连窗口（30s）内只恢复一次，切断 login 死循环。
+   */
+  lastSessionRestoreMs?: number;
+  /**
    * 最近一次成功向对端（orange 主机）写回/投递消息的时间戳，用于发侧存活检测。
    * 若长期未成功写回，说明本进程与 orange 之间的管道可能已断裂（反向存活探测）。
    */
