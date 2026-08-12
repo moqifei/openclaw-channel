@@ -6,7 +6,6 @@ import { formatSdkError } from "./utils";
 import {
   LIVENESS_CHECK_INTERVAL_MS,
   clearStdoutBroken,
-  markStdoutBroken,
   resolveLivenessTimeoutMs,
   resolveSendLivenessTimeoutMs,
   scheduleStdoutBrokenExit,
@@ -20,14 +19,19 @@ const MESSAGE_REPLAY_FILTER_WINDOW_MS = 2 * 60_000;
 
 /**
  * 发送失败自愈钩子（借鉴 orange wechat channel 的传输层重试 + 主动重建思路）：
- * media.ts 在 sendMessage 重试耗尽后回调此钩子，主动标记 stdout 断裂并触发重连，
- * 让"偶发已读不回"立即自愈，而非被动等待 180s 存活检测或重启 orange。
+ * media.ts 在 sendMessage 重试耗尽后回调此钩子。
+ *
+ * 注意：发送失败不代表与 orange 的 stdio 管道断裂，因此这里【只触发 IM 重连】，
+ * 绝不能 markStdoutBroken 导致进程自杀。否则在 open-im-server 重启、SDK 处于半死
+ * 状态时，任何一条消息（含数字分身兜底回复）的发送失败都会反复触发子进程退出，
+ * 进而引发 supervisor 无限 respawn，波及其他正常用户。
+ *
+ * 真正的 stdio 断裂由 channel.ts 的 isPipeBrokenError 判定并触发退出重建。
  */
 registerSendFailureHandler((accountId: string) => {
   const state = clients.get(accountId);
   if (!state) return;
-  // 复用 liveness 的 stdout 断裂标记与重连调度（stdoutBroken 会驱动强制重连/退出重建）。
-  markStdoutBroken(state, Date.now());
+  // 仅重建 IM SDK 连接，不触碰 stdoutBroken（避免误杀进程）。
   scheduleReconnect(undefined as any, state, "send failure after retries");
 });
 
