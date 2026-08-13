@@ -28,6 +28,15 @@ export interface OpenIMClientState {
   config: OpenIMAccountConfig;
   messageAcceptAfterMs: number;
   replayFilterUntilMs: number;
+  /**
+   * 冷启动历史同步丢弃窗口的截止时间戳。
+   * login（首次或重连重登）成功后立即进入该窗口：窗口内所有 offline 来源的历史消息
+   * 一律静默丢弃、不 markAsRead、不 dispatch，避免 SDK 冷启动自动拉取的历史会话同步
+   * （seq 从 2 涨到 N 的那一段）触发补齐循环/占用磁盘。窗口结束后恢复正常的离线消息处理。
+   * 历史消息丢了就丢了，orange 重启场景不需要这些历史。
+   * 可选：未设置（undefined/0）时视为窗口已过，正常处理所有消息。
+   */
+  coldStartHistoryUntilMs?: number;
   /** 最近一次收到消息（或连接成功）的时间戳，用于静默假死存活检测。 */
   lastMessageSeenMs: number;
   /**

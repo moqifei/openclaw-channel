@@ -558,10 +558,24 @@ export async function processInboundMessage(
   }
   // === END DIAGNOSTIC ===
 
+  // 冷启动历史同步窗口：每次 login 成功（首次或重连重登）后 COLD_START_HISTORY_WINDOW_MS
+  // 内，SDK 会自动拉取历史会话（seq 从 2 涨到 N 的那一段）。这些历史消息 orange 重启场景
+  // 不需要，直接静默丢弃 —— 不 markAsRead、不 dispatch，避免补齐循环与磁盘占用。
+  // 历史丢了就丢了。窗口结束后恢复正常的离线消息处理（若 orange 在本次重启期间真有未送达消息，仍会被处理）。
+  if (source === "offline" && Date.now() < (client.coldStartHistoryUntilMs ?? 0)) {
+    api.logger?.debug?.(`[openim] drop cold-start historical sync message (history intentionally discarded): msgID=${msgID}, seq=${msg.seq ?? "?"}`);
+    return;
+  }
+
+  // 方案 B：当 processOfflineMessages=false 时，离线/历史消息应"静默丢弃"，
+  // 不再调用 markConversationMessageAsRead。原因：markAsRead 会向 server 发送已读回执，
+  // server 回推 OnRecvC2CReadReceipt 后，SDK 会话状态机发现 maxSeq≠hasReadSeq 的缺口，
+  // 触发 Trigger conversation -> getCachedMessagesBySeqs 主动补齐历史消息，补齐到的消息
+  // 又进入本函数被再次 markAsRead -> 再次回执 -> 再次补齐……形成无限循环，线上因此把
+  // 磁盘打满。改为直接丢弃，断开这个自我循环。bot 账号的 server 端未读计数无业务意义。
   if (source === "offline" && !client.config.processOfflineMessages) {
     shouldProcessInboundMessage(client.config.accountId, msg);
-    await markInboundConversationAsRead(api, client, msg, "offline-sync");
-    api.logger?.info?.(`[openim] ignore offline synced message: msgID=${msgID}`);
+    api.logger?.info?.(`[openim] ignore offline synced message (no mark-as-read to avoid history refill loop): msgID=${msgID}`);
     return;
   }
 
@@ -569,9 +583,8 @@ export async function processInboundMessage(
   const replayFilterActive = Date.now() <= client.replayFilterUntilMs;
   if (!client.config.processOfflineMessages && replayFilterActive && msgTime > 0 && msgTime < client.messageAcceptAfterMs) {
     shouldProcessInboundMessage(client.config.accountId, msg);
-    await markInboundConversationAsRead(api, client, msg, "historical-replay");
     api.logger?.info?.(
-      `[openim] ignore historical replay message: source=${source}, msgID=${msgID}, msgTime=${msgTime}, acceptAfter=${client.messageAcceptAfterMs}, filterUntil=${client.replayFilterUntilMs}`
+      `[openim] ignore historical replay message (no mark-as-read to avoid history refill loop): source=${source}, msgID=${msgID}, msgTime=${msgTime}, acceptAfter=${client.messageAcceptAfterMs}, filterUntil=${client.replayFilterUntilMs}`
     );
     return;
   }
