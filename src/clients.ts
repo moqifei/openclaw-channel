@@ -138,10 +138,11 @@ function startLivenessMonitor(api: any, state: OpenIMClientState): void {
     const now = Date.now();
     const recvIdleMs = now - state.lastMessageSeenMs;
     const sendIdleMs = typeof state.lastFlushMs === "number" ? now - state.lastFlushMs : -1;
-    // 周期性健康快照：偶发"假死但未达阈值"时也能看到空闲时长趋势。
+    // 周期性健康快照：仅用于观测，不再因"无消息空闲"触发重连。
     api.logger?.debug?.(
       `[openim][health] account ${state.config.accountId} ` +
         `recvIdleMs=${recvIdleMs} sendIdleMs=${sendIdleMs} stdoutBroken=${!!state.stdoutBroken} ` +
+        `connectionLost=${typeof state.connectionLostAtMs === "number" ? `${Math.round((now - state.connectionLostAtMs) / 1000)}s ago` : "false"} ` +
         `reconnectRunning=${state.reconnect?.running ?? false} ` +
         `thresholds{recv=${recvTimeoutMs} send=${sendTimeoutMs}}`
     );
@@ -176,9 +177,8 @@ function describeLivenessReason(
   if (state.stdoutBroken) {
     return `stdio pipe to orange broken (detected at ${state.lastStdoutErrorMs})`;
   }
-  const recvIdleMs = now - state.lastMessageSeenMs;
-  if (recvIdleMs >= recvTimeoutMs) {
-    return `no inbound message for ${Math.round(recvIdleMs / 1000)}s >= ${Math.round(recvTimeoutMs / 1000)}s`;
+  if (typeof state.connectionLostAtMs === "number") {
+    return `connection lost ${Math.round((now - state.connectionLostAtMs) / 1000)}s ago (>= ${Math.round((recvTimeoutMs * 2) / 1000)}s grace), SDK did not self-recover`;
   }
   if (typeof sendTimeoutMs === "number" && typeof state.lastFlushMs === "number") {
     const sendIdleMs = now - state.lastFlushMs;
@@ -233,6 +233,7 @@ async function reconnectWsOnly(api: any, state: OpenIMClientState): Promise<void
     log?.warn?.(`[openim] account ${state.config.accountId} WS-only reconnect (no login, reuse existing session)`);
     await state.sdk.forceReconnect();
     reconnect.attempts = 0;
+    state.connectionLostAtMs = undefined;
     clearStdoutBroken(state);
     // forceReconnect 后会再次触发 onConnectSuccess，但此时已是同一会话，
     // needsRestore 去重逻辑会保证不重复重建。
@@ -460,18 +461,22 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       for (const msg of list) consumeMessage(msg, "offline");
     };
     state.handlers.onUserTokenExpired = (event: CallbackEvent<unknown>) => {
+      (state as OpenIMClientState).connectionLostAtMs = Date.now();
       api.logger?.warn?.(`[openim] account ${config.accountId} user token expired: ${formatSdkError(event?.data)}`);
       scheduleReconnect(api, state as OpenIMClientState, "user token expired");
     };
     state.handlers.onUserTokenInvalid = (event: CallbackEvent<unknown>) => {
+      (state as OpenIMClientState).connectionLostAtMs = Date.now();
       api.logger?.warn?.(`[openim] account ${config.accountId} user token invalid: ${formatSdkError(event?.data)}`);
       scheduleReconnect(api, state as OpenIMClientState, "user token invalid");
     };
     state.handlers.onKickedOffline = (event: CallbackEvent<unknown>) => {
+      (state as OpenIMClientState).connectionLostAtMs = Date.now();
       api.logger?.warn?.(`[openim] account ${config.accountId} kicked offline: ${formatSdkError(event?.data)}`);
       scheduleReconnect(api, state as OpenIMClientState, "kicked offline");
     };
     state.handlers.onConnectFailed = (event: CallbackEvent<unknown>) => {
+      (state as OpenIMClientState).connectionLostAtMs = Date.now();
       api.logger?.warn?.(`[openim] account ${config.accountId} connect failed: ${formatSdkError(event?.data)}`);
       scheduleReconnect(api, state as OpenIMClientState, "connect failed");
     };
@@ -481,6 +486,8 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       const prevSeen = s.lastMessageSeenMs;
       if (state.reconnect) state.reconnect.attempts = 0;
       s.lastMessageSeenMs = Date.now();
+      // 连接成功即视为"明确断连"已恢复，清除标志，避免 liveness 重复强制重连。
+      s.connectionLostAtMs = undefined;
       clearStdoutBroken(s);
 
       // 关键修复（登录风暴收敛）：

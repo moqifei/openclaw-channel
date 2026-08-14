@@ -59,6 +59,17 @@ export interface OpenIMClientState {
   lastStdoutErrorMs?: number;
   /** 管道断裂后是否已调度进程退出（去重用，避免重复 exit）。 */
   stdoutExitScheduled?: boolean;
+  /**
+   * 连接明确丢失的标志时间戳。仅当 SDK 触发明确的断连事件
+   * （OnConnectFailed / OnKickedOffline / OnUserTokenInvalid / OnUserTokenExpired）
+   * 时才置位，onConnectSuccess 时清除。
+   *
+   * 设计意图：存活检测（liveness）不应把"bot 长时间无消息"误判为"假死"而强制重连。
+   * 真正的强制重连只依赖"连接明确丢失"这一信号，避免无异常时每 3 分钟无脑重连
+   * （之前会把 bot 的安静期当作假死，反复 forceReconnect 叠加 SDK 自身重连，导致
+   * system busy / PingInterval undefined 风暴）。
+   */
+  connectionLostAtMs?: number;
   /** 存活检测定时器；超过 LIVENESS_TIMEOUT_MS 未收到消息则主动重连。 */
   livenessTimer?: ReturnType<typeof setInterval>;
   handlers: {

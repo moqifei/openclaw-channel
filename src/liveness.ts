@@ -49,14 +49,23 @@ export function shouldForceReconnect(
   const reconnect = state.reconnect;
   if (!reconnect || reconnect.stopped || reconnect.running) return false;
 
-  // 条件 3：管道已断裂，立即重连。
+  // 条件 1：管道已断裂，立即重连。
   if (state.stdoutBroken) return true;
 
-  // 条件 1：收侧超时。
-  const recvIdleMs = now - state.lastMessageSeenMs;
-  if (recvIdleMs >= recvTimeoutMs) return true;
+  // 条件 2：连接明确丢失（SDK 触发 OnConnectFailed / OnKickedOffline / OnUserToken* 等）。
+  // 这是唯一会触发"无异常时强制重连"的存活信号。
+  // 注意：不再把"收消息空闲超时（recvIdleMs >= recvTimeoutMs）"作为重连条件——
+  // bot 本就可能长时间无消息，把它当假死会导致每 recvTimeoutMs 无脑重连一次，
+  // 叠加 SDK 自身重连形成 system busy / PingInterval undefined 风暴。
+  // 真正的静默假死由 SDK 的断连回调（OnConnectFailed 等）兜底，这里只信明确断连信号。
+  if (typeof state.connectionLostAtMs === "number") {
+    // 给 SDK 自身重连一个宽限期（2 倍的收侧超时）：若 SDK 已自行恢复，
+    // onConnectSuccess 会清除 connectionLostAtMs，这里就不会重复重连。
+    const graceMs = recvTimeoutMs * 2;
+    if (now - state.connectionLostAtMs >= graceMs) return true;
+  }
 
-  // 条件 2：发侧超时（可选）。
+  // 条件 3：发侧超时（可选，反向存活探测）。
   if (typeof sendTimeoutMs === "number" && typeof state.lastFlushMs === "number") {
     const sendIdleMs = now - state.lastFlushMs;
     if (sendIdleMs >= sendTimeoutMs) return true;
