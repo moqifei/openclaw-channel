@@ -1,4 +1,4 @@
-import { CbEvents, getSDK, type CallbackEvent, type MessageItem } from "@openim/client-sdk";
+import { CbEvents, getSDK, LogLevel, type CallbackEvent, type MessageItem } from "@openim/client-sdk";
 import { processInboundMessage, type InboundMessageSource } from "./inbound";
 import { resolveAccountToken } from "./token";
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
@@ -53,48 +53,8 @@ function markColdStartHistoryWindow(state: OpenIMClientState): void {
   state.coldStartHistoryUntilMs = Date.now() + COLD_START_HISTORY_WINDOW_MS;
 }
 
-/**
- * 登录后立即把本 bot 账号所有会话标记为已读。
- * 目的：让 server 端 hasReadSeq 追上 maxSeq，使 server 的 pushSyncNotification
- * 在下次登录时计算出的 seq 区间为空的（len==0），从而不再主动推送历史消息。
- * 这是"源头断流"手段；30s 冷启动窗口作为防御兜底（mark 完成前/失败时的保护）。
- * fire-and-forget：不阻塞 login 完成，失败仅告警。
- */
-async function markAllConversationsAsRead(api: any, state: OpenIMClientState): Promise<void> {
-  const log = api?.logger ?? (state as any).logger;
-  try {
-    // 等待 SDK 登录后自动同步会话列表完成，否则 getConversationListSplit 可能返回空。
-    await new Promise<void>((resolve) => setTimeout(resolve, 1500));
-    const PAGE = 200;
-    let offset = 0;
-    let total = 0;
-    for (;;) {
-      const res: any = await state.sdk.getConversationListSplit({ offset, count: PAGE });
-      const list: any[] = Array.isArray(res?.data) ? res.data : [];
-      if (list.length === 0) break;
-      for (const conv of list) {
-        const cid = conv?.conversationID;
-        if (!cid) continue;
-        try {
-          await state.sdk.markConversationMessageAsRead(cid);
-          total++;
-        } catch (err) {
-          const text = formatSdkError(err);
-          if (!/hasReadSeq equal max|unread count is zero|conversation not exist/i.test(text)) {
-            log?.warn?.(`[openim] mark read failed during cold-start sweep: conversationID=${cid}, error=${text}`);
-          }
-        }
-      }
-      if (list.length < PAGE) break;
-      offset += PAGE;
-    }
-    log?.info?.(`[openim] cold-start mark-as-read sweep done: markedConversations=${total}`);
-  } catch (err) {
-    log?.warn?.(`[openim] cold-start mark-as-read sweep failed: ${formatSdkError(err)}`);
-  }
-}
-
 function detachHandlers(state: OpenIMClientState): void {
+  if (!state.handlersAttached) return;
   state.sdk.off(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
   state.sdk.off(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
   state.sdk.off(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
@@ -103,6 +63,7 @@ function detachHandlers(state: OpenIMClientState): void {
   if (state.handlers.onKickedOffline) state.sdk.off(CbEvents.OnKickedOffline, state.handlers.onKickedOffline);
   if (state.handlers.onConnectFailed) state.sdk.off(CbEvents.OnConnectFailed, state.handlers.onConnectFailed);
   if (state.handlers.onConnectSuccess) state.sdk.off(CbEvents.OnConnectSuccess, state.handlers.onConnectSuccess);
+  state.handlersAttached = false;
 }
 
 function scheduleReconnect(api: any, state: OpenIMClientState, reason: string): void {
@@ -126,9 +87,8 @@ function scheduleReconnect(api: any, state: OpenIMClientState, reason: string): 
 }
 
 /**
- * 启动静默假死存活检测。
- * 每隔 LIVENESS_CHECK_INTERVAL_MS 检查一次 lastMessageSeenMs，若超过阈值未收到任何消息，
- * 说明 SDK 长连接已静默失效（收不到消息也不回调 onConnectFailed），主动触发重连。
+ * 启动连接健康检测。
+ * 正常的消息空闲只记录健康快照；只有明确断连、发送侧失败或 stdio 断裂才触发重连。
  */
 function startLivenessMonitor(api: any, state: OpenIMClientState): void {
   stopLivenessMonitor(state);
@@ -199,9 +159,10 @@ function stopLivenessMonitor(state: OpenIMClientState): void {
 /**
  * 重新挂载 SDK 消息/状态监听器。open-im-server 重启后，即使连接恢复，
  * 旧的会话订阅可能失效；重新调用 sdk.on 可确保监听器绑定到新的会话上下文上。
- * 设计为可重入：重复调用不会产生重复副作用（SDK 的 on 是覆盖式注册）。
+ * SDK 的 on() 实际会追加监听器，因此必须用 handlersAttached 保证幂等。
  */
 function attachHandlers(sdk: any, state: OpenIMClientState): void {
+  if (state.handlersAttached) return;
   sdk.on(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
   sdk.on(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
   sdk.on(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
@@ -210,13 +171,9 @@ function attachHandlers(sdk: any, state: OpenIMClientState): void {
   sdk.on(CbEvents.OnKickedOffline, state.handlers.onKickedOffline);
   sdk.on(CbEvents.OnConnectFailed, state.handlers.onConnectFailed);
   sdk.on(CbEvents.OnConnectSuccess, state.handlers.onConnectSuccess);
+  state.handlersAttached = true;
 }
 
-/**
- * 重建会话：重新 login + 重新挂载监听器。解决 open-im-server 重启后
- * "显示在线但不收消息" 的问题——server 重启使旧 WS 会话的消息订阅失效，
- * 必须重新 login 以重建会话上下文。
- */
 /**
  * 仅重建 WS 长连接，不重新 login。
  * 方案 3：当 SDK 仍处于 Logged 状态时，连接断开只需重建 WS 即可复用既有会话
@@ -226,25 +183,14 @@ function attachHandlers(sdk: any, state: OpenIMClientState): void {
  */
 async function reconnectWsOnly(api: any, state: OpenIMClientState): Promise<void> {
   const reconnect = state.reconnect;
-  if (!reconnect || reconnect.stopped || reconnect.running) return;
-  reconnect.running = true;
+  if (!reconnect || reconnect.stopped) return;
   const log = api?.logger ?? (state as any).logger;
-  try {
-    log?.warn?.(`[openim] account ${state.config.accountId} WS-only reconnect (no login, reuse existing session)`);
-    await state.sdk.forceReconnect();
-    reconnect.attempts = 0;
-    state.connectionLostAtMs = undefined;
-    clearStdoutBroken(state);
-    // forceReconnect 后会再次触发 onConnectSuccess，但此时已是同一会话，
-    // needsRestore 去重逻辑会保证不重复重建。
-    log?.info?.(`[openim] account ${state.config.accountId} WS-only reconnect issued`);
-  } catch (e: any) {
-    log?.warn?.(`[openim] account ${state.config.accountId} WS-only reconnect failed (will fallback to full login): ${formatSdkError(e)}`);
-    // WS-only 失败则降级为完整 login 重连。
-    await fullLoginReconnect(api, state, "ws-only reconnect failed");
-  } finally {
-    if (reconnect) reconnect.running = false;
-  }
+  log?.warn?.(`[openim] account ${state.config.accountId} WS-only reconnect (no login, reuse existing session)`);
+  await state.sdk.forceReconnect();
+  reconnect.attempts = 0;
+  state.connectionLostAtMs = undefined;
+  clearStdoutBroken(state);
+  log?.info?.(`[openim] account ${state.config.accountId} WS-only reconnect issued`);
 }
 
 /**
@@ -253,39 +199,34 @@ async function reconnectWsOnly(api: any, state: OpenIMClientState): Promise<void
  */
 async function fullLoginReconnect(api: any, state: OpenIMClientState, reason: string): Promise<void> {
   const reconnect = state.reconnect;
-  if (!reconnect || reconnect.stopped || reconnect.running) return;
-  reconnect.running = true;
+  if (!reconnect || reconnect.stopped) return;
 
   const log = api?.logger ?? (state as any).logger;
+  log?.warn?.(`[openim] account ${state.config.accountId} full login reconnect: ${reason}`);
   try {
-    log?.warn?.(`[openim] account ${state.config.accountId} full login reconnect: ${reason}`);
-    try {
-      await state.sdk.logout();
-    } catch {
-      // Ignore logout failures; token expiry and broken sockets commonly make logout fail too.
-    }
-
-    const token = await resolveAccountToken(state.config, { forceRefresh: true });
-    state.config = { ...state.config, token };
-    markMessageAcceptWindow(state);
-    markColdStartHistoryWindow(state);
-    await state.sdk.login({
-      userID: state.config.userID,
-      token,
-      wsAddr: state.config.wsAddr,
-      apiAddr: state.config.apiAddr,
-      platformID: state.config.platformID,
-    });
-    // 重新挂载监听器，绑定到重建后的会话上下文。
-    attachHandlers(state.sdk, state);
-    reconnect.attempts = 0;
-    clearStdoutBroken(state);
-    log?.info?.(`[openim] account ${state.config.accountId} reconnected (full login)`);
-    // 源头断流：重登后把会话标为已读，使 server 端 hasReadSeq 追上 maxSeq，下次不再推历史。
-    void markAllConversationsAsRead(api, state);
-  } finally {
-    reconnect.running = false;
+    await state.sdk.logout();
+  } catch {
+    // Ignore logout failures; token expiry and broken sockets commonly make logout fail too.
   }
+
+  const token = await resolveAccountToken(state.config, { forceRefresh: true });
+  state.config = { ...state.config, token };
+  markMessageAcceptWindow(state);
+  markColdStartHistoryWindow(state);
+  await state.sdk.login({
+    userID: state.config.userID,
+    token,
+    wsAddr: state.config.wsAddr,
+    apiAddr: state.config.apiAddr,
+    platformID: state.config.platformID,
+    logLevel: state.config.sdkLogLevel ?? LogLevel.Warn,
+  });
+  // attachHandlers 是幂等的；SDK EventEmitter 不会因重复 login 而需要重复追加监听器。
+  attachHandlers(state.sdk, state);
+  reconnect.attempts = 0;
+  state.connectionLostAtMs = undefined;
+  clearStdoutBroken(state);
+  log?.info?.(`[openim] account ${state.config.accountId} reconnected (full login)`);
 }
 
 /**
@@ -299,62 +240,21 @@ async function smartReconnect(api: any, state: OpenIMClientState, reason: string
   try {
     const status = await state.sdk.getLoginStatus();
     // LoginStatus enum: Logout=1, Logging=2, Logged=3
-    logged = (status as any)?.data === 3;
+    logged = ((status as any)?.data ?? status) === 3;
   } catch {
     // getLoginStatus 不可用时保守走完整 login。
   }
   log?.info?.(`[openim] account ${state.config.accountId} smartReconnect status=${logged ? "Logged" : "not-Logged"}: ${reason}`);
   if (logged) {
-    await reconnectWsOnly(api, state);
+    try {
+      await reconnectWsOnly(api, state);
+    } catch (e: any) {
+      log?.warn?.(`[openim] account ${state.config.accountId} WS-only reconnect failed; falling back to full login: ${formatSdkError(e)}`);
+      await fullLoginReconnect(api, state, "ws-only reconnect failed");
+    }
   } else {
     await fullLoginReconnect(api, state, reason);
   }
-}
-
-async function reestablishSession(api: any, state: OpenIMClientState): Promise<void> {
-  const reconnect = state.reconnect;
-  // 与 smartReconnect 共用互斥，避免并发导致双 login 风暴。
-  if (!reconnect || reconnect.stopped || reconnect.running) return;
-  reconnect.running = true;
-  const log = api?.logger ?? (state as any).logger;
-  try {
-    // 方案 3：SDK 仍在 Logged 状态时，静默重连只需重建 WS，不重新 login，
-    // 避免 login repeat(10102) 风暴与 server 端 MultiTerminalLoginCheck 的 PlatformID 软失败。
-    // LoginStatus enum: Logout=1, Logging=2, Logged=3
-    let logged = false;
-    try {
-      const status = await state.sdk.getLoginStatus();
-      logged = (status as any)?.data === 3;
-    } catch {
-      // getLoginStatus 不可用时保守走完整 login。
-    }
-    if (logged) {
-      log?.warn?.(`[openim] account ${state.config.accountId} session re-establish via WS-only reconnect (already logged)`);
-      await state.sdk.forceReconnect();
-    } else {
-      const token = await resolveAccountToken(state.config, { forceRefresh: true }).catch(() => state.config.token ?? "");
-      state.config = { ...state.config, token };
-      markMessageAcceptWindow(state);
-      markColdStartHistoryWindow(state);
-      await state.sdk.login({
-        userID: state.config.userID,
-        token,
-        wsAddr: state.config.wsAddr,
-        apiAddr: state.config.apiAddr,
-        platformID: state.config.platformID,
-      });
-      // 源头断流：重登后把会话标为已读，使 server 端 hasReadSeq 追上 maxSeq，下次不再推历史。
-      void markAllConversationsAsRead(api, state);
-    }
-  } catch (e: any) {
-    // login 失败不致命：SDK 会自动重连并再次触发 onConnectSuccess，届时重试。
-    log?.warn?.(`[openim] account ${state.config.accountId} re-login attempt failed (will retry on next connect): ${formatSdkError(e)}`);
-  } finally {
-    reconnect.running = false;
-  }
-  // 重新挂载监听器，绑定到新会话上下文。
-  attachHandlers(state.sdk, state);
-  log?.info?.(`[openim] account ${state.config.accountId} session re-established`);
 }
 
 /**
@@ -363,7 +263,30 @@ async function reestablishSession(api: any, state: OpenIMClientState): Promise<v
  * 否则完整 login 重连。彻底规避反复 login 引发的 10102 风暴。
  */
 async function reconnectAccount(api: any, state: OpenIMClientState, reason: string): Promise<void> {
-  await smartReconnect(api, state, reason);
+  const reconnect = state.reconnect;
+  if (!reconnect || reconnect.stopped || reconnect.running) return;
+  reconnect.running = true;
+  try {
+    await smartReconnect(api, state, reason);
+  } finally {
+    reconnect.running = false;
+  }
+}
+
+function handleConnectSuccess(api: any, state: OpenIMClientState): void {
+  const reconnect = state.reconnect;
+  const recoveredFromLoss = typeof state.connectionLostAtMs === "number";
+  if (reconnect?.timer) {
+    clearTimeout(reconnect.timer);
+    reconnect.timer = undefined;
+  }
+  if (reconnect) reconnect.attempts = 0;
+  state.lastMessageSeenMs = Date.now();
+  state.connectionLostAtMs = undefined;
+  clearStdoutBroken(state);
+  api.logger?.info?.(
+    `[openim] account ${state.config.accountId} connection healthy${recoveredFromLoss ? " (SDK self-recovered; pending reconnect cancelled)" : ""}`
+  );
 }
 
 export function getConnectedClient(accountId?: string): OpenIMClientState | null {
@@ -412,6 +335,10 @@ export function __setTestClient(accountId: string, state: OpenIMClientState): vo
 
 /** 仅供单元测试：清空所有已注册客户端。 */
 export function __clearTestClients(): void {
+  for (const state of clients.values()) {
+    if (state.reconnect?.timer) clearTimeout(state.reconnect.timer);
+    if (state.livenessTimer) clearInterval(state.livenessTimer);
+  }
   clients.clear();
 }
 
@@ -429,7 +356,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       replayFilterUntilMs: Date.now() + MESSAGE_REPLAY_FILTER_WINDOW_MS,
       coldStartHistoryUntilMs: Date.now() + COLD_START_HISTORY_WINDOW_MS,
       lastMessageSeenMs: Date.now(),
-      lastSessionRestoreMs: undefined,
+      handlersAttached: false,
       handlers: {
         onRecvNewMessage: () => undefined,
         onRecvNewMessages: () => undefined,
@@ -482,54 +409,10 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
     };
     state.handlers.onConnectSuccess = () => {
       if (!state) return;
-      const s = state as OpenIMClientState;
-      const prevSeen = s.lastMessageSeenMs;
-      if (state.reconnect) state.reconnect.attempts = 0;
-      s.lastMessageSeenMs = Date.now();
-      // 连接成功即视为"明确断连"已恢复，清除标志，避免 liveness 重复强制重连。
-      s.connectionLostAtMs = undefined;
-      clearStdoutBroken(s);
-
-      // 关键修复（登录风暴收敛）：
-      // open-im-server 重启后，旧 WS 会话的消息订阅会失效，需要重新 login 重建会话。
-      // 但 SDK 每次 login 成功都会回调 onConnectSuccess，若此处无条件再 login，
-      // 会形成 login -> onConnectSuccess -> login ... 的死循环，导致 token 被高频
-      // invalidate（server 侧 DELETE_CACHE_AUTH 暴涨）进而 OOM。
-      //
-      // 防御要点：
-      //   1. 首次连接不触发（SDK 自带完整会话）。
-      //   2. 仅当存在连接"断连间隔"（非首次）且本次不是由 reconnectAccount 主动
-      //      重连引起的（reconnect.running 为 false，即 SDK 自己静默重连）时，才
-      //      触发一次 reestablishSession；reconnectAccount 自己已做 logout+login，
-      //      无需重复。
-      //   3. 用 lastSessionRestoreMs 去重：reestablishSession 内的 login 会再次触发
-      //      onConnectSuccess，必须保证同一断连窗口内只恢复一次，彻底切断死循环。
-      const firstConnect = prevSeen === undefined || prevSeen <= 0;
-      const now = Date.now();
-      const recentlyRestored = s.lastSessionRestoreMs && (now - s.lastSessionRestoreMs) < 30_000;
-      const needsRestore =
-        !firstConnect &&
-        state.reconnect &&
-        !state.reconnect.running &&
-        !state.reconnect.stopped &&
-        !recentlyRestored;
-      if (needsRestore) {
-        s.lastSessionRestoreMs = now;
-        api.logger?.warn?.(`[openim] account ${config.accountId} silent reconnect detected, re-login to restore message subscription`);
-        reestablishSession(api, s).catch((e: any) => {
-          api.logger?.error?.(`[openim] account ${config.accountId} re-login failed after reconnect: ${formatSdkError(e)}`);
-          scheduleReconnect(api, s, "re-login failed");
-        });
-      } else {
-        api.logger?.info?.(`[openim] account ${config.accountId} connection healthy`);
-      }
+      handleConnectSuccess(api, state as OpenIMClientState);
     };
 
     attachHandlers(sdk, state as OpenIMClientState);
-    // 保存 detach 能力，供重连后重新注册使用。
-    (state as any).__detachHandlers = () => detachHandlers(state as OpenIMClientState);
-    // 保存当前账号配置引用，供 onConnectSuccess 重新 login 使用。
-    (state as any).__api = api;
 
     markMessageAcceptWindow(state);
     markColdStartHistoryWindow(state);
@@ -539,17 +422,25 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       wsAddr: config.wsAddr,
       apiAddr: config.apiAddr,
       platformID: config.platformID,
+      logLevel: resolvedConfig.sdkLogLevel ?? LogLevel.Warn,
     });
     clients.set(config.accountId, state);
-    // 源头断流：登录后立即把所有会话标为已读，使 server 端 hasReadSeq 追上 maxSeq，
-    // 下次重启时 server 不再主动推送历史。fire-and-forget，不阻塞启动。
-    void markAllConversationsAsRead(api, state);
     startLivenessMonitor(api, state as OpenIMClientState);
     api.logger?.info?.(`[openim] account ${config.accountId} connected`);
   } catch (e: any) {
     if (state) detachHandlers(state);
     api.logger?.error?.(`[openim] account ${config.accountId} login failed: ${formatSdkError(e)}`);
   }
+}
+
+/** 仅供单元测试验证 SDK 监听器不会因重连重复挂载。 */
+export function __attachHandlersForTest(sdk: any, state: OpenIMClientState): void {
+  attachHandlers(sdk, state);
+}
+
+/** 仅供单元测试验证连接恢复会取消待执行的主动重连。 */
+export function __handleConnectSuccessForTest(api: any, state: OpenIMClientState): void {
+  handleConnectSuccess(api, state);
 }
 
 export async function stopAllClients(api: any): Promise<void> {

@@ -98,6 +98,8 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
   const requireMention = raw.requireMention !== false;
   const processOfflineMessages = raw.processOfflineMessages === true;
   const inboundWhitelist = normalizeInboundWhitelist(raw.inboundWhitelist);
+  const sdkLogLevelRaw = toFiniteNumber(raw.sdkLogLevel, 3);
+  const sdkLogLevel = Math.max(0, Math.min(5, Math.trunc(sdkLogLevelRaw)));
 
   if (!userID || !wsAddr || !apiAddr) return null;
   if (!token && (!adminSecret || !adminUserID)) return null;
@@ -117,6 +119,7 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
     requireMention,
     processOfflineMessages,
     inboundWhitelist,
+    sdkLogLevel,
   };
 }
 

@@ -1,4 +1,4 @@
-import { test, beforeEach } from "node:test";
+import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { OpenIMChannelPlugin } from "./channel";
 import { __setTestClient, __clearTestClients } from "./clients";
@@ -51,6 +51,7 @@ function makeState(sdk: any): OpenIMClientState {
 }
 
 beforeEach(() => { __clearTestClients(); });
+afterEach(() => { __clearTestClients(); });
 
 test("success updates lastFlushMs", async () => {
   const state = makeState(fakeSdk());

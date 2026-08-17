@@ -77,28 +77,42 @@ test("active connection (idle < timeout) does NOT force reconnect", () => {
   assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS), false);
 });
 
-test("stale connection (idle >= timeout) DOES force reconnect", () => {
+test("quiet bot traffic alone does NOT force reconnect", () => {
   const config = makeConfig();
   const state = makeState(config, {
     lastMessageSeenMs: NOW - (DEFAULT_LIVENESS_TIMEOUT_MS + 1),
   });
-  assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS), true);
+  assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS), false);
 });
 
-test("exactly at threshold boundary (idle == timeout) DOES force reconnect", () => {
+test("quiet bot at receive timeout boundary does NOT force reconnect", () => {
   const config = makeConfig();
   const state = makeState(config, {
     lastMessageSeenMs: NOW - DEFAULT_LIVENESS_TIMEOUT_MS,
   });
+  assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS), false);
+});
+
+test("custom receive timeout does not turn normal idle time into a disconnect", () => {
+  const config = makeConfig();
+  const state = makeState(config, { lastMessageSeenMs: NOW - 60_000 });
+  // Bot 长时间无人发消息是正常状态；只有明确的 SDK 断连信号才启用接收侧宽限期。
+  assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS), false);
+  assert.equal(shouldForceReconnect(state, NOW, 30_000), false);
+});
+
+test("explicit connection loss forces reconnect after the SDK recovery grace period", () => {
+  const config = makeConfig();
+  const state = makeState(config, { lastMessageSeenMs: NOW });
+  state.connectionLostAtMs = NOW - DEFAULT_LIVENESS_TIMEOUT_MS * 2;
   assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS), true);
 });
 
-test("respects custom timeoutMs parameter", () => {
+test("explicit connection loss still lets the SDK self-recover during grace period", () => {
   const config = makeConfig();
-  const state = makeState(config, { lastMessageSeenMs: NOW - 60_000 });
-  // idle 60s, default 180s -> false; custom 30s -> true
+  const state = makeState(config, { lastMessageSeenMs: NOW });
+  state.connectionLostAtMs = NOW - DEFAULT_LIVENESS_TIMEOUT_MS;
   assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS), false);
-  assert.equal(shouldForceReconnect(state, NOW, 30_000), true);
 });
 
 test("does NOT force reconnect while a reconnect is already running", () => {

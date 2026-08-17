@@ -17,6 +17,8 @@ export interface OpenIMAccountConfig {
   requireMention: boolean;
   processOfflineMessages: boolean;
   inboundWhitelist: string[];
+  /** OpenIM SDK 日志级别。默认 Warn(3)，避免 SDK Debug 日志输出完整消息体。 */
+  sdkLogLevel?: number;
   /** 可选：覆盖静默假死存活检测阈值（毫秒），默认 180000（3 分钟）。 */
   livenessTimeoutMs?: number;
   /** 可选：覆盖发侧存活检测阈值（毫秒），默认 180000（3 分钟）。仅当启用发侧探测时生效。 */
@@ -37,14 +39,8 @@ export interface OpenIMClientState {
    * 可选：未设置（undefined/0）时视为窗口已过，正常处理所有消息。
    */
   coldStartHistoryUntilMs?: number;
-  /** 最近一次收到消息（或连接成功）的时间戳，用于静默假死存活检测。 */
+  /** 最近一次收到消息（或连接成功）的时间戳，用于健康观测；正常空闲不触发重连。 */
   lastMessageSeenMs: number;
-  /**
-   * 最近一次通过 reestablishSession 恢复会话的时间戳（去重用）。
-   * onConnectSuccess 由每次 login 成功触发，reestablishSession 内部的 login 也会回调它；
-   * 用该字段保证同一断连窗口（30s）内只恢复一次，切断 login 死循环。
-   */
-  lastSessionRestoreMs?: number;
   /**
    * 最近一次成功向对端（orange 主机）写回/投递消息的时间戳，用于发侧存活检测。
    * 若长期未成功写回，说明本进程与 orange 之间的管道可能已断裂（反向存活探测）。
@@ -70,7 +66,7 @@ export interface OpenIMClientState {
    * system busy / PingInterval undefined 风暴）。
    */
   connectionLostAtMs?: number;
-  /** 存活检测定时器；超过 LIVENESS_TIMEOUT_MS 未收到消息则主动重连。 */
+  /** 存活检测定时器；检查明确断连、发送侧超时和 stdio 断裂。 */
   livenessTimer?: ReturnType<typeof setInterval>;
   handlers: {
     onRecvNewMessage: (event: CallbackEvent<MessageItem>) => void;
@@ -82,6 +78,8 @@ export interface OpenIMClientState {
     onConnectFailed?: (event: CallbackEvent<unknown>) => void;
     onConnectSuccess?: (event: CallbackEvent<unknown>) => void;
   };
+  /** SDK 的 on() 会追加监听器；该标记保证同一批回调只挂载一次。 */
+  handlersAttached?: boolean;
   reconnect?: {
     timer?: ReturnType<typeof setTimeout>;
     attempts: number;

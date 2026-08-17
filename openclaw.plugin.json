@@ -89,6 +89,13 @@
         "default": [],
         "description": "Optional sender whitelist. When set, only direct messages from listed users or their @mentions in groups are processed."
       },
+      "sdkLogLevel": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 5,
+        "default": 3,
+        "description": "OpenIM SDK log level: 0 trace, 1 debug, 2 info, 3 warn, 4 error, 5 silent. Production default is warn."
+      },
       "accounts": {
         "type": "object",
         "description": "Multi-account configuration keyed by accountId",
@@ -141,6 +148,12 @@
                 "type": "string"
               },
               "default": []
+            },
+            "sdkLogLevel": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 5,
+              "default": 3
             }
           }
         }
@@ -182,6 +195,9 @@
     },
     "inboundWhitelist": {
       "label": "Inbound Sender Whitelist"
+    },
+    "sdkLogLevel": {
+      "label": "OpenIM SDK Log Level"
     }
   }
 }

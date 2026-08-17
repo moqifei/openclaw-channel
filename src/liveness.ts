@@ -1,10 +1,10 @@
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
 
-/** 静默假死判定阈值：超过该时长未收到任何消息（含连接成功）即视为连接失效。 */
+/** 明确断连后的 SDK 自恢复基准时长；实际强制重连宽限期为该值的 2 倍。 */
 export const DEFAULT_LIVENESS_TIMEOUT_MS = 180_000; // 3 分钟
 /** 发侧存活判定阈值：超过该时长未成功向对端（orange）写回任何消息即视为管道失效。 */
 export const DEFAULT_SEND_LIVENESS_TIMEOUT_MS = 180_000; // 3 分钟
-/** 存活检测轮询间隔：定时检查 lastMessageSeenMs / lastFlushMs 是否过期。 */
+/** 存活检测轮询间隔：定时检查明确断连、发送侧和 stdio 状态。 */
 export const LIVENESS_CHECK_INTERVAL_MS = 30_000;
 
 /** 解析账号级别的收侧存活检测阈值，未配置时使用默认值。 */
@@ -116,7 +116,7 @@ export function scheduleStdoutBrokenExit(
   if (state.stdoutExitScheduled) return;
   state.stdoutExitScheduled = true;
   // 测试环境下可通过环境变量禁用真实退出，仅验证调度副作用。
-  if (process.env.OPENIM_DISABLE_STDOUT_EXIT === "1") return;
+  if (process.env.OPENIM_DISABLE_STDOUT_EXIT === "1" && exitImpl === process.exit) return;
   // 延迟一拍退出，确保当前错误日志/flush 已被上层处理，且避免同步退出打断调用栈。
   setTimeout(() => exitImpl(1), 0).unref?.();
 }

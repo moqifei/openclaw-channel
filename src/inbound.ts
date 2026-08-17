@@ -11,6 +11,7 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
 const AGENT_STREAM_EXT_TYPE = "agent_stream";
 const AGENT_STREAM_SEND_INTERVAL_MS = 250;
+const conversationReadChains = new WeakMap<OpenIMClientState, Map<string, Promise<void>>>();
 
 type ImagePart = { type: "image"; data: string; mimeType: string };
 export type InboundMessageSource = "live" | "batch" | "offline";
@@ -391,6 +392,7 @@ function createAgentStreamReplyController(
   let reasoningText = "";
   let started = false;
   let finalized = false;
+  let finalPromise: Promise<void> | undefined;
   let lastAnswerSentAt = 0;
   let lastReasoningSentAt = 0;
   let sendChain = Promise.resolve();
@@ -466,22 +468,28 @@ function createAgentStreamReplyController(
       await ensureStart();
       await enqueue("answer");
     },
-    async final(text?: string) {
-      const next = String(text || answerText || "").trim();
-      if (next) answerText = next;
-      if (!answerText && !reasoningText) {
-        log?.warn?.(`[openim][reply] stream final skipped: empty content streamID=${streamID} target=${target.kind}:${target.id}`);
-        return;
-      }
-      finalized = true;
-      await ensureStart();
-      await enqueue("final", true);
-      try {
-        await sendChain;
-        log?.info?.(`[openim][reply] stream finalized OK streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} answerChars=${answerText.length}`);
-      } catch (e: any) {
-        log?.warn?.(`[openim][reply] stream final FAILED streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`);
-      }
+    final(text?: string) {
+      // OpenClaw 可能先通过 deliver(kind=final) 投递，dispatcher 返回后本文件还会再兜底
+      // 调用一次 final()。复用同一个 Promise，确保同一 streamID 只发送一个 final 消息。
+      if (finalPromise) return finalPromise;
+      finalPromise = (async () => {
+        const next = String(text || answerText || "").trim();
+        if (next) answerText = next;
+        if (!answerText && !reasoningText) {
+          log?.warn?.(`[openim][reply] stream final skipped: empty content streamID=${streamID} target=${target.kind}:${target.id}`);
+          return;
+        }
+        await ensureStart();
+        finalized = true;
+        await enqueue("final", true);
+        try {
+          await sendChain;
+          log?.info?.(`[openim][reply] stream finalized OK streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} answerChars=${answerText.length}`);
+        } catch (e: any) {
+          log?.warn?.(`[openim][reply] stream final FAILED streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`);
+        }
+      })();
+      return finalPromise;
     },
     async error(error: unknown) {
       finalized = true;
@@ -499,6 +507,14 @@ function createAgentStreamReplyController(
   };
 }
 
+/** 仅供回归测试验证流式 final 幂等性。 */
+export const __createAgentStreamReplyControllerForTest = createAgentStreamReplyController;
+
+/** 仅供回归测试隔离模块级入站去重状态。 */
+export function __resetInboundDedupForTest(): void {
+  inboundDedup.clear();
+}
+
 function getConversationIDByInboundMessage(client: OpenIMClientState, msg: MessageItem): string {
   const sessionType = Number(msg.sessionType);
   if (sessionType === SessionType.Group && msg.groupID) {
@@ -513,17 +529,33 @@ function getConversationIDByInboundMessage(client: OpenIMClientState, msg: Messa
 async function markInboundConversationAsRead(api: any, client: OpenIMClientState, msg: MessageItem, reason: string): Promise<void> {
   const conversationID = getConversationIDByInboundMessage(client, msg);
   if (!conversationID) return;
+  let chains = conversationReadChains.get(client);
+  if (!chains) {
+    chains = new Map();
+    conversationReadChains.set(client, chains);
+  }
 
-  try {
-    await client.sdk.markConversationMessageAsRead(conversationID);
-    api.logger?.info?.(`[openim] marked conversation as read: conversationID=${conversationID}, reason=${reason}, msgID=${messageIDForLog(msg)}`);
-  } catch (err) {
-    const text = formatSdkError(err);
-    if (/hasReadSeq equal max|unread count is zero|conversation not exist/i.test(text)) {
-      api.logger?.info?.(`[openim] mark read skipped: conversationID=${conversationID}, reason=${reason}, detail=${text}`);
-      return;
+  // SDK 的 markConversationMessageAsRead 不是并发安全的：两个调用会同时读取旧的
+  // hasReadSeq/maxSeq，并各自拉取同一段历史。按会话串行化，避免并发补齐和日志风暴。
+  const previous = chains.get(conversationID) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(async () => {
+    try {
+      await client.sdk.markConversationMessageAsRead(conversationID);
+      api.logger?.debug?.(`[openim] marked conversation as read: conversationID=${conversationID}, reason=${reason}, msgID=${messageIDForLog(msg)}`);
+    } catch (err) {
+      const text = formatSdkError(err);
+      if (/hasReadSeq equal max|unread count is zero|conversation not exist/i.test(text)) {
+        api.logger?.debug?.(`[openim] mark read skipped: conversationID=${conversationID}, reason=${reason}, detail=${text}`);
+        return;
+      }
+      api.logger?.warn?.(`[openim] mark conversation as read failed: conversationID=${conversationID}, reason=${reason}, error=${text}`);
     }
-    api.logger?.warn?.(`[openim] mark conversation as read failed: conversationID=${conversationID}, reason=${reason}, error=${text}`);
+  });
+  chains.set(conversationID, current);
+  try {
+    await current;
+  } finally {
+    if (chains.get(conversationID) === current) chains.delete(conversationID);
   }
 }
 
@@ -549,7 +581,7 @@ export async function processInboundMessage(
   // fix must move to the server/SDK layer, not here.
   {
     const { ex, attachedInfo } = readExCarriers(msg);
-    api.logger?.info?.(
+    api.logger?.debug?.(
       `[openim] inbound diag: source=${source} sendID=${msg.sendID} recvID=${msg.recvID} ` +
         `contentType=${msg.contentType} clientMsgID=${msg.clientMsgID} ` +
         `ex=${ex ? ex.slice(0, 300) : "<empty>"} attachedInfo=${attachedInfo ? attachedInfo.slice(0, 200) : "<empty>"} ` +
@@ -592,6 +624,12 @@ export async function processInboundMessage(
   if (String(msg.sendID) === String(client.config.userID)) {
     return;
   }
+  if (!shouldProcessInboundMessage(client.config.accountId, msg)) {
+    // 首个回调已经负责标记已读。重复回调绝不能再次 mark-as-read，否则 SDK 会并发
+    // 拉取相同 seq 区间；生产环境监听器曾被重复挂载，正是由这里放大成日志风暴。
+    api.logger?.debug?.(`[openim] ignore duplicate inbound callback without mark-as-read: msgID=${msgID}`);
+    return;
+  }
   // Skip messages generated by a digital twin (数字分身).  The chat service
   // marks these with an `Ex` field (`openim_ext_type: "digital_twin"`).  If we
   // let another agent auto-reply to them, the digital twin and that agent loop.
@@ -600,11 +638,6 @@ export async function processInboundMessage(
     api.logger?.info?.(`[openim] ignore digital twin generated message (loop guard): clientMsgID=${msgID}, sendID=${msg.sendID}`);
     return;
   }
-  if (!shouldProcessInboundMessage(client.config.accountId, msg)) {
-    await markInboundConversationAsRead(api, client, msg, "duplicate");
-    return;
-  }
-
   const inbound = extractInboundBody(msg);
   if (!inbound.body) {
     api.logger?.info?.(
