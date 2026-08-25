@@ -15,7 +15,7 @@ const SEND_MAX_ATTEMPTS = 3;
 /** 重试退避基数（指数退避：base * 2^attempt）。 */
 const SEND_RETRY_BASE_MS = 400;
 
-/** 发送失败自愈钩子：由 clients.ts 注册，用于在重试耗尽后主动触发连接重建。 */
+/** 发送失败自愈钩子：由 clients.ts 注册，用于超时/重试耗尽后主动触发连接重建。 */
 let sendFailureHandler: ((accountId: string) => void) | null = null;
 export function registerSendFailureHandler(handler: (accountId: string) => void): void {
   sendFailureHandler = handler;
@@ -60,6 +60,7 @@ async function sendMessageWithRetry(
 ): Promise<void> {
   const logger = (client as any).logger;
   let lastErr: any;
+  let recoveryRequested = false;
   for (let attempt = 0; attempt < SEND_MAX_ATTEMPTS; attempt++) {
     if (attempt > 0) {
       const delay = SEND_RETRY_BASE_MS * 2 ** (attempt - 1);
@@ -71,6 +72,15 @@ async function sendMessageWithRetry(
       return;
     } catch (e: any) {
       lastErr = e;
+      // A timed-out SDK request can remain parked in the SDK's internal WS
+      // queue even though this wrapper rejects.  Ask the client supervisor to
+      // rebuild the connection immediately so queued requests are cancelled;
+      // otherwise every later stream frame would wait behind the same zombie
+      // request until all retries are exhausted.
+      if (e?.code === "SEND_TIMEOUT" && !recoveryRequested && sendFailureHandler) {
+        recoveryRequested = true;
+        try { sendFailureHandler(client.config.accountId); } catch { /* ignore */ }
+      }
       if (!isRetryableSendError(e)) {
         logger?.warn?.(`[openim][send] ${label} non-retryable error, giving up: ${formatSdkError(e)}`);
         throw e;

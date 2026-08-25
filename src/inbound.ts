@@ -395,56 +395,117 @@ function createAgentStreamReplyController(
   let finalPromise: Promise<void> | undefined;
   let lastAnswerSentAt = 0;
   let lastReasoningSentAt = 0;
-  let sendChain = Promise.resolve();
+  let pendingStart = false;
+  let pendingAnswer = false;
+  let pendingReasoning = false;
+  let pendingFinal = false;
+  let pendingError: string | undefined;
+  let sending = false;
+  let sendWorker: Promise<void> = Promise.resolve();
+  let lastSendError: unknown;
+  let finalSendError: unknown;
+
+  /**
+   * Send at most one in-flight stream frame and coalesce intermediate frames.
+   *
+   * The OpenIM SDK has a single request queue.  Waiting for every reasoning
+   * callback here lets one stuck WS request block Orange's dispatch completion
+   * (and therefore every later final reply).  Intermediate answer/reasoning
+   * updates are only hints, so keep the latest pending value and let the worker
+   * drain it in the background.  Terminal frames still wait for the worker.
+   */
+  const pump = (): Promise<void> => {
+    if (sending) return sendWorker;
+    sending = true;
+    sendWorker = (async () => {
+      while (pendingStart || pendingAnswer || pendingReasoning || pendingFinal || pendingError !== undefined) {
+        let event: AgentStreamEvent;
+        let errorText = "";
+        if (pendingStart) {
+          pendingStart = false;
+          event = "start";
+        } else if (pendingError !== undefined) {
+          errorText = pendingError;
+          pendingError = undefined;
+          pendingAnswer = false;
+          pendingReasoning = false;
+          event = "error";
+        } else if (pendingFinal) {
+          pendingFinal = false;
+          pendingAnswer = false;
+          pendingReasoning = false;
+          event = "final";
+        } else if (pendingAnswer) {
+          pendingAnswer = false;
+          event = "answer";
+        } else {
+          pendingReasoning = false;
+          event = "reasoning";
+        }
+
+        const payload = {
+          ...basePayload,
+          event,
+          status: event === "final" ? "done" : event === "error" ? "error" : "streaming",
+          answerText,
+          reasoningText,
+          errorText,
+          updatedAt: Date.now(),
+        };
+        const description =
+          event === "final"
+            ? answerText || "智能体回复"
+            : event === "reasoning"
+              ? "智能体正在思考"
+              : "智能体正在回复";
+        try {
+          await sendCustomToTarget(client, target, payload, description);
+          const line =
+            `[openim] agent stream custom sent streamID=${streamID} event=${event} ` +
+            `status=${payload.status} answerChars=${answerText.length} reasoningChars=${reasoningText.length}`;
+          if (event === "final" || event === "error" || event === "start") {
+            log?.info?.(line);
+          } else {
+            log?.debug?.(line);
+          }
+        } catch (e: any) {
+          lastSendError = e;
+          if (event === "final") finalSendError = e;
+          log?.warn?.(
+            `[openim][reply] agent stream custom FAILED streamID=${streamID} event=${event} ` +
+              `target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`
+          );
+          // Do not reject the worker: a failed interim frame must not poison
+          // the queue and prevent a later final frame from being attempted.
+        }
+      }
+    })().finally(() => {
+      sending = false;
+    });
+    return sendWorker;
+  };
 
   const enqueue = (event: AgentStreamEvent, force = false, errorText = "") => {
-    if (finalized && event !== "final" && event !== "error") return sendChain;
+    if (finalized && event !== "final" && event !== "error") return pump();
     const now = Date.now();
     if (!force && event === "answer" && now - lastAnswerSentAt < AGENT_STREAM_SEND_INTERVAL_MS) {
-      return sendChain;
+      return pump();
     }
     if (!force && event === "reasoning" && now - lastReasoningSentAt < AGENT_STREAM_SEND_INTERVAL_MS) {
-      return sendChain;
+      return pump();
     }
     if (event === "answer") lastAnswerSentAt = now;
     if (event === "reasoning") lastReasoningSentAt = now;
-
-    const payload = {
-      ...basePayload,
-      event,
-      status: event === "final" ? "done" : event === "error" ? "error" : "streaming",
-      answerText,
-      reasoningText,
-      errorText,
-      updatedAt: now,
-    };
-    const description =
-      event === "final"
-        ? answerText || "智能体回复"
-        : event === "reasoning"
-          ? "智能体正在思考"
-          : "智能体正在回复";
-    sendChain = sendChain.then(async () => {
-      try {
-        await sendCustomToTarget(client, target, payload, description);
-        const line =
-          `[openim] agent stream custom sent streamID=${streamID} event=${event} ` +
-          `status=${payload.status} answerChars=${answerText.length} reasoningChars=${reasoningText.length}`;
-        if (event === "final" || event === "error" || event === "start") {
-          log?.info?.(line);
-        } else {
-          log?.debug?.(line);
-        }
-      } catch (e: any) {
-        log?.warn?.(`[openim][reply] agent stream custom FAILED streamID=${streamID} event=${event} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`);
-        throw e;
-      }
-    });
-    return sendChain;
+    if (event === "start") pendingStart = true;
+    else if (event === "answer") pendingAnswer = true;
+    else if (event === "reasoning") pendingReasoning = true;
+    else if (event === "final") pendingFinal = true;
+    else pendingError = errorText;
+    return pump();
   };
 
   const ensureStart = () => {
-    if (started) return sendChain;
+    if (started) return pump();
     started = true;
     return enqueue("start", true);
   };
@@ -452,21 +513,22 @@ function createAgentStreamReplyController(
   return {
     streamID,
     async start() {
-      await ensureStart();
+      // Starting the cosmetic stream must never hold Orange's dispatch loop.
+      void ensureStart();
     },
     async updateReasoning(text: string) {
       const next = String(text || "");
       if (!next || next === reasoningText) return;
       reasoningText = next;
-      await ensureStart();
-      await enqueue("reasoning");
+      void ensureStart();
+      void enqueue("reasoning");
     },
     async updateAnswer(text: string) {
       const next = String(text || "");
       if (!next || next === answerText) return;
       answerText = next;
-      await ensureStart();
-      await enqueue("answer");
+      void ensureStart();
+      void enqueue("answer");
     },
     final(text?: string) {
       // OpenClaw 可能先通过 deliver(kind=final) 投递，dispatcher 返回后本文件还会再兜底
@@ -479,26 +541,51 @@ function createAgentStreamReplyController(
           log?.warn?.(`[openim][reply] stream final skipped: empty content streamID=${streamID} target=${target.kind}:${target.id}`);
           return;
         }
-        await ensureStart();
+        // A terminal frame supersedes queued cosmetic updates.  Do not await
+        // the cosmetic start frame: if its WS request is stuck, final must be
+        // queued behind it immediately so the worker can converge after the
+        // send timeout instead of blocking Orange's dispatch callback.
+        if (!started) started = true;
+        void ensureStart();
         finalized = true;
+        pendingAnswer = false;
+        pendingReasoning = false;
         await enqueue("final", true);
-        try {
-          await sendChain;
+        await pump();
+        if (finalSendError) {
+          log?.warn?.(
+            `[openim][reply] stream final FAILED streamID=${streamID} target=${target.kind}:${target.id} ` +
+              `account=${client.config.accountId} error=${formatSdkError(finalSendError)}`
+          );
+          // The stream card is best-effort.  A plain text fallback keeps the
+          // user-visible reply path alive when a custom WS frame is rejected.
+          if (answerText) {
+            try {
+              await sendReplyFromInbound(client, msg, answerText);
+              log?.info?.(
+                `[openim][reply] stream final fallback text sent streamID=${streamID} ` +
+                  `target=${target.kind}:${target.id} answerChars=${answerText.length}`
+              );
+            } catch (fallbackError) {
+              log?.warn?.(
+                `[openim][reply] stream final fallback text FAILED streamID=${streamID} ` +
+                  `target=${target.kind}:${target.id} error=${formatSdkError(fallbackError)}`
+              );
+            }
+          }
+        } else {
           log?.info?.(`[openim][reply] stream finalized OK streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} answerChars=${answerText.length}`);
-        } catch (e: any) {
-          log?.warn?.(`[openim][reply] stream final FAILED streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`);
         }
       })();
       return finalPromise;
     },
     async error(error: unknown) {
       finalized = true;
-      await ensureStart();
+      if (!sending) pendingStart = false;
       await enqueue("error", true, formatSdkError(error));
-      try {
-        await sendChain;
-      } catch (e: any) {
-        log?.warn?.(`[openim][reply] stream error FAILED streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(e)}`);
+      await pump();
+      if (lastSendError) {
+        log?.warn?.(`[openim][reply] stream error FAILED streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} error=${formatSdkError(lastSendError)}`);
       }
     },
     hasContent() {

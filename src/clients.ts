@@ -371,6 +371,11 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
 
     const consumeMessage = (msg: MessageItem, source: InboundMessageSource) => {
       (state as OpenIMClientState).lastMessageSeenMs = Date.now();
+      api.logger?.debug?.(
+        `[openim][recv] account=${config.accountId} source=${source} ` +
+          `msgID=${msg.clientMsgID || msg.serverMsgID || "<none>"} ` +
+          `sendID=${msg.sendID || "<none>"} contentType=${msg.contentType ?? "<none>"}`
+      );
       processInboundMessage(api, state as OpenIMClientState, msg, source).catch((e: any) => {
         api.logger?.error?.(`[openim] processInboundMessage failed: ${formatSdkError(e)}`);
       });

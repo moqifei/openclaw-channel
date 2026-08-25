@@ -81,6 +81,31 @@ test("agent stream final is sent exactly once when final() is called twice", asy
   assert.equal(events.filter((event) => event === "final").length, 1);
 });
 
+test("stream updates are coalesced so Orange dispatch is not serialized on every token", async () => {
+  const events: string[] = [];
+  const sdk = {
+    async createCustomMessage(input: { data: string }) {
+      events.push(JSON.parse(input.data).event);
+      return { data: { customElem: input } };
+    },
+    async sendMessage() {
+      return { data: {} };
+    },
+  };
+  const controller = __createAgentStreamReplyControllerForTest(state(sdk), message(), silentLogger());
+
+  // Simulate a fast reasoning/answer stream.  Only the latest intermediate
+  // frame should be sent; the terminal frame must still be delivered.
+  for (let i = 0; i < 50; i++) {
+    await controller.updateReasoning(`thinking-${i}`);
+    await controller.updateAnswer(`answer-${i}`);
+  }
+  await controller.final("answer-final");
+
+  assert.equal(events.filter((event) => event === "final").length, 1);
+  assert.ok(events.length <= 4, `expected coalesced stream frames, got ${events.join(",")}`);
+});
+
 test("duplicate SDK callbacks do not issue duplicate mark-as-read requests", async () => {
   let markReadCalls = 0;
   const sdk = {
