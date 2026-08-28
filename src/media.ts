@@ -3,6 +3,7 @@ import { File } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { basename, extname } from "node:path";
+import { updateLastFlush } from "./liveness";
 import { getRecvAndGroupID } from "./targets";
 import { formatSdkError } from "./utils";
 import type { OpenIMClientState, ParsedTarget } from "./types";
@@ -21,12 +22,30 @@ export function registerSendFailureHandler(handler: (accountId: string) => void)
   sendFailureHandler = handler;
 }
 
-function withSendTimeout<T>(p: Promise<T>, label: string, logger?: any): Promise<T> {
+function cancelSdkMessageTasks(client: OpenIMClientState, label: string, logger?: any): void {
+  try {
+    const cancel = (client.sdk as any).cancelMessageTasks;
+    if (typeof cancel === "function") {
+      cancel.call(client.sdk);
+      logger?.warn?.(`[openim][send] ${label} cancelled pending SDK message tasks after timeout`);
+    }
+  } catch (e: any) {
+    logger?.warn?.(`[openim][send] ${label} failed to cancel pending SDK message tasks: ${formatSdkError(e)}`);
+  }
+}
+
+function withSendTimeout<T>(
+  p: Promise<T>,
+  label: string,
+  logger?: any,
+  onTimeout?: () => void,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => {
       const err = new Error(`sendMessage timed out after ${SEND_MESSAGE_TIMEOUT_MS}ms (${label})`);
       (err as any).code = "SEND_TIMEOUT";
       logger?.error?.(`[openim][send] ${label} TIMEOUT after ${SEND_MESSAGE_TIMEOUT_MS}ms`);
+      try { onTimeout?.(); } catch { /* cancellation is best effort */ }
       reject(err);
     }, SEND_MESSAGE_TIMEOUT_MS);
     p.then(
@@ -68,7 +87,13 @@ async function sendMessageWithRetry(
       await new Promise((r) => setTimeout(r, delay));
     }
     try {
-      await withSendTimeout(client.sdk.sendMessage(payload), label, logger);
+      await withSendTimeout(
+        Promise.resolve().then(() => client.sdk.sendMessage(payload)),
+        label,
+        logger,
+        () => cancelSdkMessageTasks(client, label, logger),
+      );
+      updateLastFlush(client, Date.now());
       return;
     } catch (e: any) {
       lastErr = e;

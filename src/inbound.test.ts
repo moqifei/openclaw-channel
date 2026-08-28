@@ -62,6 +62,25 @@ function silentLogger() {
 
 beforeEach(() => __resetInboundDedupForTest());
 
+test("start emits an immediate agent stream start frame", async () => {
+  const events: string[] = [];
+  const sdk = {
+    async createCustomMessage(input: { data: string }) {
+      events.push(JSON.parse(input.data).event);
+      return { data: { customElem: input } };
+    },
+    async sendMessage() {
+      return { data: {} };
+    },
+  };
+  const controller = __createAgentStreamReplyControllerForTest(state(sdk), message(), silentLogger());
+
+  await controller.start();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(events[0], "start");
+});
+
 test("agent stream final is sent exactly once when final() is called twice", async () => {
   const events: string[] = [];
   const sdk = {
@@ -106,6 +125,29 @@ test("stream updates are coalesced so Orange dispatch is not serialized on every
   assert.ok(events.length <= 4, `expected coalesced stream frames, got ${events.join(",")}`);
 });
 
+test("final does not wait for cosmetic stream frames", async () => {
+  const events: string[] = [];
+  let resolveSend!: () => void;
+  const sdk = {
+    async createCustomMessage(input: { data: string }) {
+      const event = JSON.parse(input.data).event;
+      events.push(event);
+      return { data: { customElem: input } };
+    },
+    async sendMessage() {
+      await new Promise<void>((resolve) => { resolveSend = resolve; });
+      return { data: {} };
+    },
+  };
+  const controller = __createAgentStreamReplyControllerForTest(state(sdk), message(), silentLogger());
+  await controller.updateAnswer("reply");
+  const finalPromise = controller.final("reply");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.filter((event) => event === "final").length, 1);
+  resolveSend();
+  await finalPromise;
+});
+
 test("duplicate SDK callbacks do not issue duplicate mark-as-read requests", async () => {
   let markReadCalls = 0;
   const sdk = {
@@ -144,5 +186,49 @@ test("duplicate SDK callbacks do not issue duplicate mark-as-read requests", asy
     processInboundMessage(api, client, msg, "batch"),
   ]);
 
+  // Accepted-message read receipts are intentionally deferred until after the
+  // reply dispatch has started, so a broken SDK history pull cannot block the
+  // Orange response path.
+  await new Promise((resolve) => setTimeout(resolve, 2_600));
+
   assert.equal(markReadCalls, 1);
+});
+
+test("a stuck mark-as-read request cannot block Orange dispatch", async () => {
+  let dispatchCalls = 0;
+  const sdk = {
+    async markConversationMessageAsRead() {
+      await new Promise<void>(() => {});
+    },
+    async getUsersInfo() {
+      return { data: [{ userID: "user-1", nickname: "User One" }] };
+    },
+    async createCustomMessage(input: { data: string }) {
+      return { data: { customElem: input } };
+    },
+    async sendMessage() {
+      return { data: {} };
+    },
+  };
+  const client = state(sdk);
+  const api = {
+    config: {},
+    logger: silentLogger(),
+    runtime: {
+      channel: {
+        reply: {
+          async dispatchReplyWithBufferedBlockDispatcher(params: any) {
+            dispatchCalls += 1;
+            await params.dispatcherOptions.deliver({ text: "reply" }, { kind: "final" });
+          },
+        },
+      },
+    },
+  };
+
+  const startedAt = Date.now();
+  await processInboundMessage(api, client, message("stuck-read"), "live");
+
+  assert.equal(dispatchCalls, 1);
+  assert.ok(Date.now() - startedAt < 1_000, "dispatch should not wait for mark-as-read");
 });

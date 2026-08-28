@@ -11,6 +11,13 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
 const AGENT_STREAM_EXT_TYPE = "agent_stream";
 const AGENT_STREAM_SEND_INTERVAL_MS = 250;
+/** Do not let a terminal custom-message frame hold the user-visible reply. */
+const AGENT_STREAM_FINAL_WAIT_MS = 2_000;
+/** Mark-as-read is bookkeeping for the bot; never let it delay dispatch. */
+const MARK_READ_TIMEOUT_MS = 5_000;
+// Give the terminal stream frame time to complete (or trigger its 2s
+// recovery) before mark-as-read can enqueue another SDK WS request.
+const MARK_READ_SETTLE_DELAY_MS = AGENT_STREAM_FINAL_WAIT_MS + 500;
 const conversationReadChains = new WeakMap<OpenIMClientState, Map<string, Promise<void>>>();
 
 type ImagePart = { type: "image"; data: string; mimeType: string };
@@ -412,7 +419,8 @@ function createAgentStreamReplyController(
    * callback here lets one stuck WS request block Orange's dispatch completion
    * (and therefore every later final reply).  Intermediate answer/reasoning
    * updates are only hints, so keep the latest pending value and let the worker
-   * drain it in the background.  Terminal frames still wait for the worker.
+   * drain it in the background.  Terminal frames are queued ahead of cosmetic
+   * frames and are also observed in the background by the caller.
    */
   const pump = (): Promise<void> => {
     if (sending) return sendWorker;
@@ -421,10 +429,9 @@ function createAgentStreamReplyController(
       while (pendingStart || pendingAnswer || pendingReasoning || pendingFinal || pendingError !== undefined) {
         let event: AgentStreamEvent;
         let errorText = "";
-        if (pendingStart) {
-          pendingStart = false;
-          event = "start";
-        } else if (pendingError !== undefined) {
+        // Terminal events always win over cosmetic stream frames.  A queued
+        // start/reasoning frame must never delay the actual answer.
+        if (pendingError !== undefined) {
           errorText = pendingError;
           pendingError = undefined;
           pendingAnswer = false;
@@ -435,6 +442,9 @@ function createAgentStreamReplyController(
           pendingAnswer = false;
           pendingReasoning = false;
           event = "final";
+        } else if (pendingStart) {
+          pendingStart = false;
+          event = "start";
         } else if (pendingAnswer) {
           pendingAnswer = false;
           event = "answer";
@@ -513,22 +523,25 @@ function createAgentStreamReplyController(
   return {
     streamID,
     async start() {
-      // Starting the cosmetic stream must never hold Orange's dispatch loop.
-      void ensureStart();
+      // Notify the client immediately so it can create the waiting/stream
+      // reply window.  This is deliberately fire-and-forget: a stuck WS
+      // request must never hold Orange's dispatch callback or delay final text.
+      void ensureStart().catch((error) => {
+        log?.warn?.(
+          `[openim][reply] agent stream start FAILED streamID=${streamID} ` +
+            `target=${target.kind}:${target.id} error=${formatSdkError(error)}`
+        );
+      });
     },
     async updateReasoning(text: string) {
       const next = String(text || "");
       if (!next || next === reasoningText) return;
       reasoningText = next;
-      void ensureStart();
-      void enqueue("reasoning");
     },
     async updateAnswer(text: string) {
       const next = String(text || "");
       if (!next || next === answerText) return;
       answerText = next;
-      void ensureStart();
-      void enqueue("answer");
     },
     final(text?: string) {
       // OpenClaw 可能先通过 deliver(kind=final) 投递，dispatcher 返回后本文件还会再兜底
@@ -541,47 +554,72 @@ function createAgentStreamReplyController(
           log?.warn?.(`[openim][reply] stream final skipped: empty content streamID=${streamID} target=${target.kind}:${target.id}`);
           return;
         }
-        // A terminal frame supersedes queued cosmetic updates.  Do not await
-        // the cosmetic start frame: if its WS request is stuck, final must be
-        // queued behind it immediately so the worker can converge after the
-        // send timeout instead of blocking Orange's dispatch callback.
-        if (!started) started = true;
-        void ensureStart();
+        // Only the terminal stream frame is sent.  Intermediate stream frames
+        // are intentionally kept local; they are cosmetic and can otherwise
+        // occupy the SDK's single WS request queue indefinitely.
+        started = true;
+        pendingStart = false;
         finalized = true;
         pendingAnswer = false;
         pendingReasoning = false;
-        await enqueue("final", true);
-        await pump();
-        if (finalSendError) {
-          log?.warn?.(
-            `[openim][reply] stream final FAILED streamID=${streamID} target=${target.kind}:${target.id} ` +
-              `account=${client.config.accountId} error=${formatSdkError(finalSendError)}`
-          );
-          // The stream card is best-effort.  A plain text fallback keeps the
-          // user-visible reply path alive when a custom WS frame is rejected.
-          if (answerText) {
+        void enqueue("final", true);
+        const finalWorker = pump();
+        const finalTimeout = new Promise<"timeout">((resolve) => {
+          const timer = setTimeout(() => resolve("timeout"), AGENT_STREAM_FINAL_WAIT_MS);
+          timer.unref?.();
+        });
+        void Promise.race([finalWorker.then(() => "done" as const), finalTimeout]).then(async (result) => {
+          if (result === "timeout" && !finalSendError) {
+            finalSendError = new Error(`agent stream final timed out after ${AGENT_STREAM_FINAL_WAIT_MS}ms`);
             try {
-              await sendReplyFromInbound(client, msg, answerText);
-              log?.info?.(
-                `[openim][reply] stream final fallback text sent streamID=${streamID} ` +
-                  `target=${target.kind}:${target.id} answerChars=${answerText.length}`
-              );
-            } catch (fallbackError) {
-              log?.warn?.(
-                `[openim][reply] stream final fallback text FAILED streamID=${streamID} ` +
-                  `target=${target.kind}:${target.id} error=${formatSdkError(fallbackError)}`
-              );
+              (client.sdk as any).cancelMessageTasks?.();
+            } catch {
+              // Best effort; media.ts will also cancel tasks on its timeout.
             }
+            try {
+              // Closing the current WS also rejects the SDK requestMap entry;
+              // cancelMessageTasks alone only clears queued (not in-flight)
+              // message tasks in @openim/client-sdk.
+              void (client.sdk as any).forceReconnect?.();
+            } catch {
+              // The normal send retry/reconnect path remains as a fallback.
+            }
+            void client.requestReconnect?.("stream final timeout");
+            log?.warn?.(`[openim][reply] stream final timed out; falling back to text streamID=${streamID}`);
           }
-        } else {
-          log?.info?.(`[openim][reply] stream finalized OK streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} answerChars=${answerText.length}`);
-        }
+          if (finalSendError) {
+            log?.warn?.(
+              `[openim][reply] stream final FAILED streamID=${streamID} target=${target.kind}:${target.id} ` +
+                `account=${client.config.accountId} error=${formatSdkError(finalSendError)}`
+            );
+            // The stream card is best-effort.  A plain text fallback keeps the
+            // user-visible reply path alive when a custom WS frame is rejected.
+            if (answerText) {
+              try {
+                await sendReplyFromInbound(client, msg, answerText);
+                log?.info?.(
+                  `[openim][reply] stream final fallback text sent streamID=${streamID} ` +
+                    `target=${target.kind}:${target.id} answerChars=${answerText.length}`
+                );
+              } catch (fallbackError) {
+                log?.warn?.(
+                  `[openim][reply] stream final fallback text FAILED streamID=${streamID} ` +
+                    `target=${target.kind}:${target.id} error=${formatSdkError(fallbackError)}`
+                );
+              }
+            }
+          } else {
+            log?.info?.(`[openim][reply] stream finalized OK streamID=${streamID} target=${target.kind}:${target.id} account=${client.config.accountId} answerChars=${answerText.length}`);
+          }
+        }).catch((error) => {
+          log?.warn?.(`[openim][reply] stream final worker failed streamID=${streamID} error=${formatSdkError(error)}`);
+        });
       })();
       return finalPromise;
     },
     async error(error: unknown) {
       finalized = true;
-      if (!sending) pendingStart = false;
+      pendingStart = false;
       await enqueue("error", true, formatSdkError(error));
       await pump();
       if (lastSendError) {
@@ -627,7 +665,14 @@ async function markInboundConversationAsRead(api: any, client: OpenIMClientState
   const previous = chains.get(conversationID) ?? Promise.resolve();
   const current = previous.catch(() => undefined).then(async () => {
     try {
-      await client.sdk.markConversationMessageAsRead(conversationID);
+      const markRead = Promise.resolve().then(() => client.sdk.markConversationMessageAsRead(conversationID));
+      await Promise.race([
+        markRead,
+        new Promise<never>((_, reject) => {
+          const timer = setTimeout(() => reject(new Error(`markConversationMessageAsRead timed out after ${MARK_READ_TIMEOUT_MS}ms`)), MARK_READ_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
       api.logger?.debug?.(`[openim] marked conversation as read: conversationID=${conversationID}, reason=${reason}, msgID=${messageIDForLog(msg)}`);
     } catch (err) {
       const text = formatSdkError(err);
@@ -636,6 +681,14 @@ async function markInboundConversationAsRead(api: any, client: OpenIMClientState
         return;
       }
       api.logger?.warn?.(`[openim] mark conversation as read failed: conversationID=${conversationID}, reason=${reason}, error=${text}`);
+      if (/markConversationMessageAsRead timed out/i.test(text)) {
+        try {
+          (client.sdk as any).cancelMessageTasks?.();
+        } catch {
+          // Best effort; a fresh SDK instance is the reliable recovery path.
+        }
+        void client.requestReconnect?.("mark read timeout");
+      }
     }
   });
   chains.set(conversationID, current);
@@ -750,8 +803,6 @@ export async function processInboundMessage(
     await markInboundConversationAsRead(api, client, msg, "not-mentioned");
     return;
   }
-
-  await markInboundConversationAsRead(api, client, msg, "accepted");
 
   const baseSessionKey = group ? `openim:group:${msg.groupID}`.toLowerCase() : `openim:${msg.sendID}`.toLowerCase();
   const cfg = api.config;
@@ -948,5 +999,15 @@ export async function processInboundMessage(
     } catch {
       // ignore secondary send errors
     }
+  } finally {
+    // Do not run SDK mark-as-read before dispatch.  In v3.8.3 it may pull a
+    // missing sequence range over the same WS request queue used by replies;
+    // a stuck history pull then makes the bot appear to have silently ignored
+    // the inbound message.  Once the reply path has been kicked off, perform
+    // the bookkeeping asynchronously and recover if the SDK remains stuck.
+    const timer = setTimeout(() => {
+      void markInboundConversationAsRead(api, client, msg, "accepted");
+    }, MARK_READ_SETTLE_DELAY_MS);
+    timer.unref?.();
   }
 }

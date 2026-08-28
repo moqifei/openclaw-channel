@@ -21,7 +21,7 @@ export interface OpenIMAccountConfig {
   sdkLogLevel?: number;
   /** 可选：覆盖静默假死存活检测阈值（毫秒），默认 180000（3 分钟）。 */
   livenessTimeoutMs?: number;
-  /** 可选：覆盖发侧存活检测阈值（毫秒），默认 180000（3 分钟）。仅当启用发侧探测时生效。 */
+  /** 可选：启用发侧存活检测并设置阈值（毫秒）。默认关闭，避免把业务空闲误判为断连。 */
   sendLivenessTimeoutMs?: number;
 }
 
@@ -86,6 +86,8 @@ export interface OpenIMClientState {
     running: boolean;
     stopped: boolean;
   };
+  /** Account-scoped fresh-SDK recovery used by a terminal reply timeout. */
+  requestReconnect?: (reason: string) => Promise<void>;
 }
 
 export interface ParsedTarget {

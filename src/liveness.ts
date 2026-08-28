@@ -2,8 +2,12 @@ import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
 
 /** 明确断连后的 SDK 自恢复基准时长；实际强制重连宽限期为该值的 2 倍。 */
 export const DEFAULT_LIVENESS_TIMEOUT_MS = 180_000; // 3 分钟
-/** 发侧存活判定阈值：超过该时长未成功向对端（orange）写回任何消息即视为管道失效。 */
-export const DEFAULT_SEND_LIVENESS_TIMEOUT_MS = 180_000; // 3 分钟
+/**
+ * 发侧存活探测默认关闭。lastFlushMs 记录的是业务发送时间而非
+ * Orange stdio 心跳；默认按时长判定会把正常业务空闲误判为断连，
+ * 反复 forceReconnect 并触发 SDK 历史同步。
+ */
+export const DEFAULT_SEND_LIVENESS_TIMEOUT_MS: number | undefined = undefined;
 /** 存活检测轮询间隔：定时检查明确断连、发送侧和 stdio 状态。 */
 export const LIVENESS_CHECK_INTERVAL_MS = 30_000;
 
@@ -12,8 +16,8 @@ export function resolveLivenessTimeoutMs(config: OpenIMAccountConfig): number {
   return config.livenessTimeoutMs ?? DEFAULT_LIVENESS_TIMEOUT_MS;
 }
 
-/** 解析账号级别的发侧存活检测阈值，未配置时使用默认值。 */
-export function resolveSendLivenessTimeoutMs(config: OpenIMAccountConfig): number {
+/** 解析账号级别的发侧存活检测阈值；未配置时保持关闭。 */
+export function resolveSendLivenessTimeoutMs(config: OpenIMAccountConfig): number | undefined {
   return config.sendLivenessTimeoutMs ?? DEFAULT_SEND_LIVENESS_TIMEOUT_MS;
 }
 

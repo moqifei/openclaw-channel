@@ -132,7 +132,7 @@ function describeLivenessReason(
   state: OpenIMClientState,
   now: number,
   recvTimeoutMs: number,
-  sendTimeoutMs: number
+  sendTimeoutMs?: number
 ): string {
   if (state.stdoutBroken) {
     return `stdio pipe to orange broken (detected at ${state.lastStdoutErrorMs})`;
@@ -194,6 +194,57 @@ async function reconnectWsOnly(api: any, state: OpenIMClientState): Promise<void
 }
 
 /**
+ * Replace the SDK instance when its internal message task/request map is
+ * poisoned. @openim/client-sdk's cancelMessageTasks() only cancels queued
+ * tasks; an in-flight sendReqWaitResp can remain pending forever. Reusing that
+ * SDK would therefore keep every later send behind the same zombie task.
+ */
+async function replaceSdkAndLogin(api: any, state: OpenIMClientState, reason: string): Promise<void> {
+  const reconnect = state.reconnect;
+  if (!reconnect || reconnect.stopped) return;
+  const log = api?.logger ?? (state as any).logger;
+  const previousSdk = state.sdk;
+  log?.warn?.(`[openim] account ${state.config.accountId} replacing SDK instance: ${reason}`);
+
+  detachHandlers(state);
+  try {
+    // logout() performs a local SDK reset/WS close. Do not let a broken
+    // transport prevent creation of the replacement instance.
+    await Promise.race([
+      Promise.resolve(previousSdk.logout()),
+      new Promise((resolve) => setTimeout(resolve, 1_000)),
+    ]);
+  } catch {
+    // Ignore failures from the poisoned SDK instance.
+  }
+
+  const sdk = getSDK();
+  state.sdk = sdk;
+  const token = await resolveAccountToken(state.config, { forceRefresh: true });
+  state.config = { ...state.config, token };
+  markMessageAcceptWindow(state);
+  markColdStartHistoryWindow(state);
+  attachHandlers(sdk, state);
+  try {
+    await sdk.login({
+      userID: state.config.userID,
+      token,
+      wsAddr: state.config.wsAddr,
+      apiAddr: state.config.apiAddr,
+      platformID: state.config.platformID,
+      logLevel: state.config.sdkLogLevel ?? LogLevel.Warn,
+    });
+  } catch (e) {
+    detachHandlers(state);
+    throw e;
+  }
+  reconnect.attempts = 0;
+  state.connectionLostAtMs = undefined;
+  clearStdoutBroken(state);
+  log?.info?.(`[openim] account ${state.config.accountId} reconnected with a fresh SDK instance`);
+}
+
+/**
  * 完整 login 重连：logout（容忍失败）+ 重新 login + 重挂监听器。
  * 仅当 SDK 已不在 Logged 状态（token 失效 / 被踢 / 会话完全丢失）时使用。
  */
@@ -203,30 +254,7 @@ async function fullLoginReconnect(api: any, state: OpenIMClientState, reason: st
 
   const log = api?.logger ?? (state as any).logger;
   log?.warn?.(`[openim] account ${state.config.accountId} full login reconnect: ${reason}`);
-  try {
-    await state.sdk.logout();
-  } catch {
-    // Ignore logout failures; token expiry and broken sockets commonly make logout fail too.
-  }
-
-  const token = await resolveAccountToken(state.config, { forceRefresh: true });
-  state.config = { ...state.config, token };
-  markMessageAcceptWindow(state);
-  markColdStartHistoryWindow(state);
-  await state.sdk.login({
-    userID: state.config.userID,
-    token,
-    wsAddr: state.config.wsAddr,
-    apiAddr: state.config.apiAddr,
-    platformID: state.config.platformID,
-    logLevel: state.config.sdkLogLevel ?? LogLevel.Warn,
-  });
-  // attachHandlers 是幂等的；SDK EventEmitter 不会因重复 login 而需要重复追加监听器。
-  attachHandlers(state.sdk, state);
-  reconnect.attempts = 0;
-  state.connectionLostAtMs = undefined;
-  clearStdoutBroken(state);
-  log?.info?.(`[openim] account ${state.config.accountId} reconnected (full login)`);
+  await replaceSdkAndLogin(api, state, reason);
 }
 
 /**
@@ -236,6 +264,13 @@ async function fullLoginReconnect(api: any, state: OpenIMClientState, reason: st
  */
 async function smartReconnect(api: any, state: OpenIMClientState, reason: string): Promise<void> {
   const log = api?.logger ?? (state as any).logger;
+  // A send timeout means the SDK's in-flight task queue may be poisoned. A
+  // forceReconnect on the same instance cannot release that active task, so
+  // replace the SDK object instead of attempting WS-only recovery.
+  if (/send failure|stream final|send timeout|mark read/i.test(reason)) {
+    await fullLoginReconnect(api, state, reason);
+    return;
+  }
   let logged = false;
   try {
     const status = await state.sdk.getLoginStatus();
@@ -368,6 +403,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
         stopped: false,
       },
     } as OpenIMClientState;
+    state.requestReconnect = (reason: string) => reconnectAccount(api, state as OpenIMClientState, reason);
 
     const consumeMessage = (msg: MessageItem, source: InboundMessageSource) => {
       (state as OpenIMClientState).lastMessageSeenMs = Date.now();

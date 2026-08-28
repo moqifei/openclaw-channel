@@ -2,7 +2,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_LIVENESS_TIMEOUT_MS,
-  DEFAULT_SEND_LIVENESS_TIMEOUT_MS,
   clearStdoutBroken,
   isPipeBrokenError,
   isStdoutBroken,
@@ -14,6 +13,8 @@ import {
   updateLastFlush,
 } from "./liveness";
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
+
+const SEND_TEST_TIMEOUT_MS = 180_000;
 
 function makeConfig(overrides: Partial<OpenIMAccountConfig> = {}): OpenIMAccountConfig {
   return {
@@ -195,12 +196,12 @@ test("#1 broken pipe still forces reconnect before reconnect controller settles"
 });
 
 // ---------------------------------------------------------------------------
-// #2 收发双维存活检测：发侧（写回 orange）超时也要重连
+// #2 收发双维存活检测：发侧探测显式配置后才启用
 // ---------------------------------------------------------------------------
 
-test("resolveSendLivenessTimeoutMs returns default when not configured", () => {
+test("resolveSendLivenessTimeoutMs is disabled by default", () => {
   const config = makeConfig();
-  assert.equal(resolveSendLivenessTimeoutMs(config), DEFAULT_SEND_LIVENESS_TIMEOUT_MS);
+  assert.equal(resolveSendLivenessTimeoutMs(config), undefined);
 });
 
 test("resolveSendLivenessTimeoutMs honors per-account override", () => {
@@ -213,7 +214,7 @@ test("#2 active connection (both sides fresh) does NOT force reconnect", () => {
   const state = makeState(config, { lastMessageSeenMs: NOW - 1_000 });
   state.lastFlushMs = NOW - 1_000;
   assert.equal(
-    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, DEFAULT_SEND_LIVENESS_TIMEOUT_MS),
+    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, SEND_TEST_TIMEOUT_MS),
     false
   );
 });
@@ -222,9 +223,9 @@ test("#2 send-side stale (no flush to orange) DOES force reconnect", () => {
   const config = makeConfig();
   const state = makeState(config, { lastMessageSeenMs: NOW - 1_000 });
   // 收侧还很新鲜，但发侧已超过阈值未成功写回
-  state.lastFlushMs = NOW - (DEFAULT_SEND_LIVENESS_TIMEOUT_MS + 1);
+  state.lastFlushMs = NOW - (SEND_TEST_TIMEOUT_MS + 1);
   assert.equal(
-    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, DEFAULT_SEND_LIVENESS_TIMEOUT_MS),
+    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, SEND_TEST_TIMEOUT_MS),
     true
   );
 });
@@ -232,7 +233,7 @@ test("#2 send-side stale (no flush to orange) DOES force reconnect", () => {
 test("#2 send-side timeout ignored when sendTimeoutMs not provided (backward compatible)", () => {
   const config = makeConfig();
   const state = makeState(config, { lastMessageSeenMs: NOW - 1_000 });
-  state.lastFlushMs = NOW - (DEFAULT_SEND_LIVENESS_TIMEOUT_MS + 1_000);
+  state.lastFlushMs = NOW - (SEND_TEST_TIMEOUT_MS + 1_000);
   // 不传 sendTimeoutMs 时只检收侧，发侧过期不影响
   assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS), false);
 });
@@ -240,9 +241,9 @@ test("#2 send-side timeout ignored when sendTimeoutMs not provided (backward com
 test("#2 send-side exactly at boundary triggers reconnect", () => {
   const config = makeConfig();
   const state = makeState(config, { lastMessageSeenMs: NOW });
-  state.lastFlushMs = NOW - DEFAULT_SEND_LIVENESS_TIMEOUT_MS;
+  state.lastFlushMs = NOW - SEND_TEST_TIMEOUT_MS;
   assert.equal(
-    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, DEFAULT_SEND_LIVENESS_TIMEOUT_MS),
+    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, SEND_TEST_TIMEOUT_MS),
     true
   );
 });
@@ -251,9 +252,9 @@ test("#2 custom send timeout respected", () => {
   const config = makeConfig();
   const state = makeState(config, { lastMessageSeenMs: NOW });
   state.lastFlushMs = NOW - 60_000;
-  // 发侧空闲 60s，默认发侧阈值 180s -> false；自定义 30s -> true
+  // 发侧空闲 60s，显式阈值 180s -> false；自定义 30s -> true
   assert.equal(
-    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, DEFAULT_SEND_LIVENESS_TIMEOUT_MS),
+    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, SEND_TEST_TIMEOUT_MS),
     false
   );
   assert.equal(shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, 30_000), true);
@@ -266,7 +267,7 @@ test("#2 broken pipe takes precedence over fresh timers", () => {
   markStdoutBroken(state, NOW);
   // 即便收发两侧都健康，管道断裂也应立即重连
   assert.equal(
-    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, DEFAULT_SEND_LIVENESS_TIMEOUT_MS),
+    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, SEND_TEST_TIMEOUT_MS),
     true
   );
 });
@@ -285,12 +286,12 @@ test("describe/health helpers integrate: successful flush then broken pipe", () 
   const state = makeState(config, { lastMessageSeenMs: NOW });
   updateLastFlush(state, NOW);
   assert.equal(
-    shouldForceReconnect(state, NOW + 10_000, DEFAULT_LIVENESS_TIMEOUT_MS, DEFAULT_SEND_LIVENESS_TIMEOUT_MS),
+    shouldForceReconnect(state, NOW + 10_000, DEFAULT_LIVENESS_TIMEOUT_MS, SEND_TEST_TIMEOUT_MS),
     false
   );
   markStdoutBroken(state, NOW + 11_000);
   assert.equal(
-    shouldForceReconnect(state, NOW + 12_000, DEFAULT_LIVENESS_TIMEOUT_MS, DEFAULT_SEND_LIVENESS_TIMEOUT_MS),
+    shouldForceReconnect(state, NOW + 12_000, DEFAULT_LIVENESS_TIMEOUT_MS, SEND_TEST_TIMEOUT_MS),
     true
   );
 });
@@ -339,7 +340,7 @@ test("#3 integration: broken pipe triggers both detection and exit", async () =>
   // 模拟 outbound 探测到 EPIPE
   markStdoutBroken(state, NOW);
   assert.equal(
-    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, DEFAULT_SEND_LIVENESS_TIMEOUT_MS),
+    shouldForceReconnect(state, NOW, DEFAULT_LIVENESS_TIMEOUT_MS, SEND_TEST_TIMEOUT_MS),
     true
   );
   let exited: number | null = null;

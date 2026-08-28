@@ -100,6 +100,12 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
   const inboundWhitelist = normalizeInboundWhitelist(raw.inboundWhitelist);
   const sdkLogLevelRaw = toFiniteNumber(raw.sdkLogLevel, 3);
   const sdkLogLevel = Math.max(0, Math.min(5, Math.trunc(sdkLogLevelRaw)));
+  const livenessTimeoutMs = raw.livenessTimeoutMs === undefined
+    ? undefined
+    : Math.max(1_000, toFiniteNumber(raw.livenessTimeoutMs, NaN));
+  const sendLivenessTimeoutMs = raw.sendLivenessTimeoutMs === undefined
+    ? undefined
+    : Math.max(1_000, toFiniteNumber(raw.sendLivenessTimeoutMs, NaN));
 
   if (!userID || !wsAddr || !apiAddr) return null;
   if (!token && (!adminSecret || !adminUserID)) return null;
@@ -120,6 +126,8 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
     processOfflineMessages,
     inboundWhitelist,
     sdkLogLevel,
+    ...(Number.isFinite(livenessTimeoutMs) ? { livenessTimeoutMs } : {}),
+    ...(Number.isFinite(sendLivenessTimeoutMs) ? { sendLivenessTimeoutMs } : {}),
   };
 }
 

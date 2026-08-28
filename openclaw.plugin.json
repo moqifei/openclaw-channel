@@ -96,6 +96,14 @@
         "default": 3,
         "description": "OpenIM SDK log level: 0 trace, 1 debug, 2 info, 3 warn, 4 error, 5 silent. Production default is warn."
       },
+      "livenessTimeoutMs": {
+        "type": "number",
+        "description": "Optional explicit receive-side disconnect grace threshold in milliseconds."
+      },
+      "sendLivenessTimeoutMs": {
+        "type": "number",
+        "description": "Optional send-side liveness threshold in milliseconds. Disabled by default."
+      },
       "accounts": {
         "type": "object",
         "description": "Multi-account configuration keyed by accountId",
@@ -154,6 +162,13 @@
               "minimum": 0,
               "maximum": 5,
               "default": 3
+            },
+            "livenessTimeoutMs": {
+              "type": "number"
+            },
+            "sendLivenessTimeoutMs": {
+              "type": "number",
+              "description": "Optional send-side liveness threshold; disabled when omitted."
             }
           }
         }
@@ -198,6 +213,12 @@
     },
     "sdkLogLevel": {
       "label": "OpenIM SDK Log Level"
+    },
+    "livenessTimeoutMs": {
+      "label": "Receive Liveness Timeout (ms)"
+    },
+    "sendLivenessTimeoutMs": {
+      "label": "Send Liveness Timeout (ms)"
     }
   }
 }
