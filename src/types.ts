@@ -71,7 +71,10 @@ export interface OpenIMClientState {
   handlers: {
     onRecvNewMessage: (event: CallbackEvent<MessageItem>) => void;
     onRecvNewMessages: (event: CallbackEvent<MessageItem[]>) => void;
+    onRecvOfflineNewMessage?: (event: CallbackEvent<MessageItem>) => void;
     onRecvOfflineNewMessages: (event: CallbackEvent<MessageItem[]>) => void;
+    onConversationChanged?: (event: CallbackEvent<unknown>) => void;
+    onTotalUnreadMessageCountChanged?: (event: CallbackEvent<unknown>) => void;
     onUserTokenExpired?: (event: CallbackEvent<unknown>) => void;
     onUserTokenInvalid?: (event: CallbackEvent<unknown>) => void;
     onKickedOffline?: (event: CallbackEvent<unknown>) => void;

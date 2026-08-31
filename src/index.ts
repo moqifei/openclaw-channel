@@ -12,6 +12,10 @@ import { listEnabledAccountConfigs } from "./config";
 import { registerHttpTokenInjector } from "./http-token-injector";
 import { registerOpenIMTools } from "./tools";
 
+// Bump this marker whenever inbound diagnostics change. It lets us identify
+// the loaded dist artifact directly from gateway.log after deployment.
+const OPENIM_DIAGNOSTIC_VERSION = "read-debug-2026-08-31.2";
+
 // 全局兜底：任何未捕获异常 / 未处理的 Promise 拒绝都只记录日志，绝不退出进程。
 // 否则 open-im-server 重启、网络抖动、SDK 回调抛错等偶发异常会直接 kill 整个
 // channel 子进程，触发 orange supervisor 反复 respawn，导致所有分身用户被波及、
@@ -56,6 +60,8 @@ export type {
 export default function register(api: any): void {
   (globalThis as any).__openimApi = api;
   (globalThis as any).__openimGatewayConfig = api.config;
+
+  api.logger?.info?.(`[openim][startup] diagnosticVersion=${OPENIM_DIAGNOSTIC_VERSION} pluginEntry=src/index.ts`);
 
   api.registerChannel({ plugin: OpenIMChannelPlugin });
 

@@ -15,10 +15,9 @@ const AGENT_STREAM_SEND_INTERVAL_MS = 250;
 const AGENT_STREAM_FINAL_WAIT_MS = 2_000;
 /** Mark-as-read is bookkeeping for the bot; never let it delay dispatch. */
 const MARK_READ_TIMEOUT_MS = 5_000;
-// Give the terminal stream frame time to complete (or trigger its 2s
-// recovery) before mark-as-read can enqueue another SDK WS request.
-const MARK_READ_SETTLE_DELAY_MS = AGENT_STREAM_FINAL_WAIT_MS + 500;
-const conversationReadChains = new WeakMap<OpenIMClientState, Map<string, Promise<void>>>();
+const conversationReadChains = new WeakMap<OpenIMClientState, Map<string, Promise<MarkReadResult>>>();
+
+type MarkReadResult = "success" | "already-read" | "failed";
 
 type ImagePart = { type: "image"; data: string; mimeType: string };
 export type InboundMessageSource = "live" | "batch" | "offline";
@@ -645,15 +644,31 @@ function getConversationIDByInboundMessage(client: OpenIMClientState, msg: Messa
   if (sessionType === SessionType.Group && msg.groupID) {
     return `sg_${msg.groupID}`;
   }
+  // The conversation cache is keyed by the logged-in user's ID.  Do not use
+  // msg.recvID here: some OpenIM delivery paths leave it empty or carry a
+  // stale recipient value, which makes markConversationMessageAsRead operate
+  // on a different C2C conversation than the one owned by this SDK instance.
+  const selfUserID = String(client.config.userID);
+  const peerUserID = String(msg.sendID);
   if (sessionType === SessionType.Notification) {
-    return `sn_${[msg.sendID, msg.recvID || client.config.userID].map(String).sort().join("_")}`;
+    return `sn_${[peerUserID, selfUserID].sort().join("_")}`;
   }
-  return `si_${[msg.sendID, msg.recvID || client.config.userID].map(String).sort().join("_")}`;
+  return `si_${[peerUserID, selfUserID].sort().join("_")}`;
 }
 
-async function markInboundConversationAsRead(api: any, client: OpenIMClientState, msg: MessageItem, reason: string): Promise<void> {
+async function markInboundConversationAsRead(
+  api: any,
+  client: OpenIMClientState,
+  msg: MessageItem,
+  reason: string
+): Promise<MarkReadResult> {
   const conversationID = getConversationIDByInboundMessage(client, msg);
-  if (!conversationID) return;
+  if (!conversationID) return "failed";
+  api.logger?.info?.(
+    `[openim][read] begin account=${client.config.accountId} userID=${client.config.userID} ` +
+      `conversationID=${conversationID} reason=${reason} msgID=${messageIDForLog(msg)} ` +
+      `sendID=${msg.sendID || "<none>"} recvID=${msg.recvID || "<none>"} seq=${msg.seq ?? "<none>"}`
+  );
   let chains = conversationReadChains.get(client);
   if (!chains) {
     chains = new Map();
@@ -662,7 +677,7 @@ async function markInboundConversationAsRead(api: any, client: OpenIMClientState
 
   // SDK 的 markConversationMessageAsRead 不是并发安全的：两个调用会同时读取旧的
   // hasReadSeq/maxSeq，并各自拉取同一段历史。按会话串行化，避免并发补齐和日志风暴。
-  const previous = chains.get(conversationID) ?? Promise.resolve();
+  const previous = chains.get(conversationID) ?? Promise.resolve<MarkReadResult>("success");
   const current = previous.catch(() => undefined).then(async () => {
     try {
       const markRead = Promise.resolve().then(() => client.sdk.markConversationMessageAsRead(conversationID));
@@ -673,14 +688,21 @@ async function markInboundConversationAsRead(api: any, client: OpenIMClientState
           timer.unref?.();
         }),
       ]);
-      api.logger?.debug?.(`[openim] marked conversation as read: conversationID=${conversationID}, reason=${reason}, msgID=${messageIDForLog(msg)}`);
+      api.logger?.info?.(
+        `[openim][read] success account=${client.config.accountId} conversationID=${conversationID}, ` +
+          `reason=${reason}, msgID=${messageIDForLog(msg)}`
+      );
+      return "success";
     } catch (err) {
       const text = formatSdkError(err);
       if (/hasReadSeq equal max|unread count is zero|conversation not exist/i.test(text)) {
-        api.logger?.debug?.(`[openim] mark read skipped: conversationID=${conversationID}, reason=${reason}, detail=${text}`);
-        return;
+        api.logger?.info?.(`[openim][read] skipped: conversationID=${conversationID}, reason=${reason}, detail=${text}`);
+        return "already-read";
       }
-      api.logger?.warn?.(`[openim] mark conversation as read failed: conversationID=${conversationID}, reason=${reason}, error=${text}`);
+      api.logger?.error?.(
+        `[openim][read] FAILED account=${client.config.accountId} conversationID=${conversationID}, ` +
+          `reason=${reason}, msgID=${messageIDForLog(msg)}, error=${text}`
+      );
       if (/markConversationMessageAsRead timed out/i.test(text)) {
         try {
           (client.sdk as any).cancelMessageTasks?.();
@@ -689,11 +711,12 @@ async function markInboundConversationAsRead(api: any, client: OpenIMClientState
         }
         void client.requestReconnect?.("mark read timeout");
       }
+      return "failed";
     }
   });
   chains.set(conversationID, current);
   try {
-    await current;
+    return await current;
   } finally {
     if (chains.get(conversationID) === current) chains.delete(conversationID);
   }
@@ -705,6 +728,18 @@ export async function processInboundMessage(
   msg: MessageItem,
   source: InboundMessageSource = "live"
 ): Promise<void> {
+  // Keep direct/test callers and the real channel account context consistent:
+  // the shim's gateway.startAccount context has `log`, not `logger`.
+  if (!api?.logger && api?.log) {
+    api.logger = api.log;
+  }
+  const earlyMsgID = messageIDForLog(msg);
+  api.logger?.info?.(
+    `[openim][inbound] entered account=${client.config.accountId} userID=${client.config.userID} ` +
+      `source=${source} msgID=${earlyMsgID} sendID=${msg.sendID || "<none>"} ` +
+      `recvID=${msg.recvID || "<none>"} seq=${msg.seq ?? "<none>"} ` +
+      `sessionType=${msg.sessionType ?? "<none>"} contentType=${msg.contentType ?? "<none>"}`
+  );
   const runtime = api.runtime;
   if (!runtime?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
     api.logger?.warn?.("[openim] runtime.channel.reply not available");
@@ -762,12 +797,13 @@ export async function processInboundMessage(
   }
 
   if (String(msg.sendID) === String(client.config.userID)) {
+    api.logger?.info?.(`[openim][inbound] ignored self-sent message account=${client.config.accountId} msgID=${msgID} sendID=${msg.sendID}`);
     return;
   }
   if (!shouldProcessInboundMessage(client.config.accountId, msg)) {
     // 首个回调已经负责标记已读。重复回调绝不能再次 mark-as-read，否则 SDK 会并发
     // 拉取相同 seq 区间；生产环境监听器曾被重复挂载，正是由这里放大成日志风暴。
-    api.logger?.debug?.(`[openim] ignore duplicate inbound callback without mark-as-read: msgID=${msgID}`);
+    api.logger?.info?.(`[openim][inbound] ignored duplicate callback account=${client.config.accountId} msgID=${msgID}`);
     return;
   }
   // Skip messages generated by a digital twin (数字分身).  The chat service
@@ -779,6 +815,21 @@ export async function processInboundMessage(
     return;
   }
   const inbound = extractInboundBody(msg);
+  api.logger?.info?.(
+    `[openim][inbound] accepted account=${client.config.accountId} msgID=${msgID} ` +
+      `kind=${inbound.kind} bodyLen=${inbound.body.length} mediaCount=${inbound.media?.length ?? 0}`
+  );
+
+  // Start the read receipt immediately after accepting the live message, before
+  // user lookup/media materialization/agent dispatch can send a bot message.
+  // The OpenIM SDK updates the local conversation maxSeq while sending the bot
+  // reply. If markConversationMessageAsRead runs only in finally, that update
+  // can make the SDK conclude that hasReadSeq already equals maxSeq and skip the
+  // server-side read receipt. Keep the promise for a post-dispatch compensation
+  // attempt when this early call fails or observes an already-advanced cache.
+  const earlyReadPromise = markInboundConversationAsRead(api, client, msg, "accepted-before-dispatch");
+  void earlyReadPromise.catch(() => undefined);
+
   if (!inbound.body) {
     api.logger?.info?.(
       `[openim] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`
@@ -927,6 +978,10 @@ export async function processInboundMessage(
       dispatcherOptions: {
         deliver: async (payload: { text?: string }, info?: { kind?: string }) => {
           if (!payload.text) return;
+          api.logger?.info?.(
+            `[openim][reply] deliver account=${client.config.accountId} streamID=${streamReply.streamID} ` +
+              `kind=${info?.kind || "partial"} textLen=${payload.text.length}`
+          );
           try {
             if (info?.kind === "final") {
               await streamReply.final(payload.text);
@@ -938,6 +993,7 @@ export async function processInboundMessage(
           }
         },
         onReplyStart: async () => {
+          api.logger?.info?.(`[openim][reply] start account=${client.config.accountId} streamID=${streamReply.streamID}`);
           try {
             await streamReply.start();
           } catch (e: any) {
@@ -987,7 +1043,12 @@ export async function processInboundMessage(
         },
       },
     });
+    api.logger?.info?.(
+      `[openim][flow] inbound dispatch returned account=${client.config.accountId} ` +
+        `msgID=${msgID} hasContent=${streamReply.hasContent()}`
+    );
     if (streamReply.hasContent()) {
+      api.logger?.info?.(`[openim][reply] final enqueue account=${client.config.accountId} streamID=${streamReply.streamID}`);
       await streamReply.final();
     }
   } catch (err: any) {
@@ -1000,14 +1061,25 @@ export async function processInboundMessage(
       // ignore secondary send errors
     }
   } finally {
-    // Do not run SDK mark-as-read before dispatch.  In v3.8.3 it may pull a
-    // missing sequence range over the same WS request queue used by replies;
-    // a stuck history pull then makes the bot appear to have silently ignored
-    // the inbound message.  Once the reply path has been kicked off, perform
-    // the bookkeeping asynchronously and recover if the SDK remains stuck.
-    const timer = setTimeout(() => {
-      void markInboundConversationAsRead(api, client, msg, "accepted");
-    }, MARK_READ_SETTLE_DELAY_MS);
-    timer.unref?.();
+    // The terminal stream frame is queued before dispatch returns.  Start the
+    // read update on the next turn so the final send gets first access to the
+    // SDK request queue, but do not add a fixed multi-second delay: the user
+    // client should receive the read receipt as soon as the bot reply has
+    // been accepted by OpenIM.
+    api.logger?.info?.(`[openim][read] schedule account=${client.config.accountId} msgID=${msgID} delay=next-turn compensation=true`);
+    setImmediate(() => {
+      api.logger?.info?.(`[openim][read] invoke account=${client.config.accountId} msgID=${msgID} reason=accepted-after-dispatch`);
+      void earlyReadPromise
+        .then((result) => {
+          if (result === "success") {
+            api.logger?.info?.(`[openim][read] compensation not needed account=${client.config.accountId} msgID=${msgID}`);
+            return undefined;
+          }
+          return markInboundConversationAsRead(api, client, msg, "accepted-after-dispatch");
+        })
+        .catch((error) => {
+          api.logger?.warn?.(`[openim][read] compensation failed account=${client.config.accountId} msgID=${msgID} error=${formatSdkError(error)}`);
+        });
+    });
   }
 }

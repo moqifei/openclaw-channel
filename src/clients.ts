@@ -57,7 +57,10 @@ function detachHandlers(state: OpenIMClientState): void {
   if (!state.handlersAttached) return;
   state.sdk.off(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
   state.sdk.off(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
+  if (state.handlers.onRecvOfflineNewMessage) state.sdk.off(CbEvents.OnRecvOfflineNewMessage, state.handlers.onRecvOfflineNewMessage);
   state.sdk.off(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
+  if (state.handlers.onConversationChanged) state.sdk.off(CbEvents.OnConversationChanged, state.handlers.onConversationChanged);
+  if (state.handlers.onTotalUnreadMessageCountChanged) state.sdk.off(CbEvents.OnTotalUnreadMessageCountChanged, state.handlers.onTotalUnreadMessageCountChanged);
   if (state.handlers.onUserTokenExpired) state.sdk.off(CbEvents.OnUserTokenExpired, state.handlers.onUserTokenExpired);
   if (state.handlers.onUserTokenInvalid) state.sdk.off(CbEvents.OnUserTokenInvalid, state.handlers.onUserTokenInvalid);
   if (state.handlers.onKickedOffline) state.sdk.off(CbEvents.OnKickedOffline, state.handlers.onKickedOffline);
@@ -165,7 +168,10 @@ function attachHandlers(sdk: any, state: OpenIMClientState): void {
   if (state.handlersAttached) return;
   sdk.on(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
   sdk.on(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
+  if (state.handlers.onRecvOfflineNewMessage) sdk.on(CbEvents.OnRecvOfflineNewMessage, state.handlers.onRecvOfflineNewMessage);
   sdk.on(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
+  if (state.handlers.onConversationChanged) sdk.on(CbEvents.OnConversationChanged, state.handlers.onConversationChanged);
+  if (state.handlers.onTotalUnreadMessageCountChanged) sdk.on(CbEvents.OnTotalUnreadMessageCountChanged, state.handlers.onTotalUnreadMessageCountChanged);
   sdk.on(CbEvents.OnUserTokenExpired, state.handlers.onUserTokenExpired);
   sdk.on(CbEvents.OnUserTokenInvalid, state.handlers.onUserTokenInvalid);
   sdk.on(CbEvents.OnKickedOffline, state.handlers.onKickedOffline);
@@ -378,6 +384,15 @@ export function __clearTestClients(): void {
 }
 
 export async function startAccountClient(api: any, config: OpenIMAccountConfig): Promise<void> {
+  // OpenClaw's channel account context exposes `log`, while the plugin API
+  // exposes `logger`.  The shim passes the former to gateway.startAccount;
+  // normalize it here so all inbound/read diagnostics use the same
+  // `[bridge:openim] ...` log.write path instead of being silently skipped.
+  if (!api?.logger && api?.log) {
+    api.logger = api.log;
+  }
+  api.logger?.info?.(`[openim][startup] logger adapter ready account=${config.accountId} source=${api?.logger === api?.log ? "channel.log" : "api.logger"}`);
+
   const sdk = getSDK();
   let state: OpenIMClientState | null = null;
   try {
@@ -395,7 +410,10 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       handlers: {
         onRecvNewMessage: () => undefined,
         onRecvNewMessages: () => undefined,
+        onRecvOfflineNewMessage: () => undefined,
         onRecvOfflineNewMessages: () => undefined,
+        onConversationChanged: () => undefined,
+        onTotalUnreadMessageCountChanged: () => undefined,
       },
       reconnect: {
         attempts: 0,
@@ -407,10 +425,14 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
 
     const consumeMessage = (msg: MessageItem, source: InboundMessageSource) => {
       (state as OpenIMClientState).lastMessageSeenMs = Date.now();
-      api.logger?.debug?.(
+      api.logger?.info?.(
         `[openim][recv] account=${config.accountId} source=${source} ` +
           `msgID=${msg.clientMsgID || msg.serverMsgID || "<none>"} ` +
-          `sendID=${msg.sendID || "<none>"} contentType=${msg.contentType ?? "<none>"}`
+          `serverMsgID=${msg.serverMsgID || "<none>"} ` +
+          `sendID=${msg.sendID || "<none>"} recvID=${msg.recvID || "<none>"} ` +
+          `seq=${msg.seq ?? "<none>"} sessionType=${msg.sessionType ?? "<none>"} ` +
+          `groupID=${msg.groupID || "<none>"} contentType=${msg.contentType ?? "<none>"} ` +
+          `textLen=${msg.textElem?.content?.length ?? 0}`
       );
       processInboundMessage(api, state as OpenIMClientState, msg, source).catch((e: any) => {
         api.logger?.error?.(`[openim] processInboundMessage failed: ${formatSdkError(e)}`);
@@ -418,15 +440,67 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
     };
 
     state.handlers.onRecvNewMessage = (event: CallbackEvent<MessageItem>) => {
+      api.logger?.info?.(
+        `[openim][callback] OnRecvNewMessage account=${config.accountId} ` +
+          `hasData=${Boolean(event?.data)} operationID=${event?.operationID || "<none>"} ` +
+          `errCode=${event?.errCode ?? 0} errMsg=${event?.errMsg || "<none>"}`
+      );
       if (event?.data) consumeMessage(event.data, "live");
+      else api.logger?.warn?.(`[openim][callback] OnRecvNewMessage has no data account=${config.accountId}`);
+    };
+    state.handlers.onRecvOfflineNewMessage = (event: CallbackEvent<MessageItem>) => {
+      api.logger?.info?.(
+        `[openim][callback] OnRecvOfflineNewMessage account=${config.accountId} ` +
+          `hasData=${Boolean(event?.data)} operationID=${event?.operationID || "<none>"} ` +
+          `errCode=${event?.errCode ?? 0} errMsg=${event?.errMsg || "<none>"}`
+      );
+      if (event?.data) consumeMessage(event.data, "offline");
+      else api.logger?.warn?.(`[openim][callback] OnRecvOfflineNewMessage has no data account=${config.accountId}`);
     };
     state.handlers.onRecvNewMessages = (event: CallbackEvent<MessageItem[]>) => {
       const list = Array.isArray(event?.data) ? event.data : [];
+      api.logger?.info?.(
+        `[openim][callback] OnRecvNewMessages account=${config.accountId} count=${list.length} ` +
+          `operationID=${event?.operationID || "<none>"} errCode=${event?.errCode ?? 0} ` +
+          `errMsg=${event?.errMsg || "<none>"}`
+      );
       for (const msg of list) consumeMessage(msg, "batch");
     };
     state.handlers.onRecvOfflineNewMessages = (event: CallbackEvent<MessageItem[]>) => {
       const list = Array.isArray(event?.data) ? event.data : [];
+      api.logger?.info?.(
+        `[openim][callback] OnRecvOfflineNewMessages account=${config.accountId} count=${list.length} ` +
+          `operationID=${event?.operationID || "<none>"} errCode=${event?.errCode ?? 0} ` +
+          `errMsg=${event?.errMsg || "<none>"}`
+      );
       for (const msg of list) consumeMessage(msg, "offline");
+    };
+    state.handlers.onConversationChanged = (event: CallbackEvent<unknown>) => {
+      const list = Array.isArray(event?.data) ? event.data : [];
+      const summary = list.slice(0, 10).map((item: any) => {
+        const latest = typeof item?.latestMsg === "string" ? item.latestMsg : "";
+        let latestSeq = "<none>";
+        let latestSender = "<none>";
+        try {
+          const parsed = JSON.parse(latest);
+          latestSeq = String(parsed?.seq ?? "<none>");
+          latestSender = String(parsed?.sendID ?? "<none>");
+        } catch {
+          // The SDK may emit a conversation without a parseable latestMsg.
+        }
+        return `${item?.conversationID || "<none>"}{user=${item?.userID || "<none>"},unread=${item?.unreadCount ?? "<none>"},latestSeq=${latestSeq},latestSender=${latestSender}}`;
+      }).join(";");
+      api.logger?.info?.(
+        `[openim][conversation] changed account=${config.accountId} count=${list.length} ` +
+          `operationID=${event?.operationID || "<none>"} unreadTotalHint=${summary || "<none>"}`
+      );
+    };
+    state.handlers.onTotalUnreadMessageCountChanged = (event: CallbackEvent<unknown>) => {
+      api.logger?.info?.(
+        `[openim][conversation] total unread changed account=${config.accountId} ` +
+          `value=${event?.data ?? "<none>"} operationID=${event?.operationID || "<none>"} ` +
+          `errCode=${event?.errCode ?? 0} errMsg=${event?.errMsg || "<none>"}`
+      );
     };
     state.handlers.onUserTokenExpired = (event: CallbackEvent<unknown>) => {
       (state as OpenIMClientState).connectionLostAtMs = Date.now();
@@ -454,9 +528,18 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
     };
 
     attachHandlers(sdk, state as OpenIMClientState);
+    api.logger?.info?.(
+      `[openim][startup] handlers attached account=${config.accountId} userID=${config.userID} ` +
+        `events=OnRecvNewMessage,OnRecvNewMessages,OnRecvOfflineNewMessage,OnRecvOfflineNewMessages,` +
+        `OnConversationChanged,OnTotalUnreadMessageCountChanged`
+    );
 
     markMessageAcceptWindow(state);
     markColdStartHistoryWindow(state);
+    api.logger?.info?.(
+      `[openim][startup] login begin account=${config.accountId} userID=${config.userID} ` +
+        `wsAddr=${config.wsAddr} apiAddr=${config.apiAddr}`
+    );
     await sdk.login({
       userID: config.userID,
       token,
@@ -465,6 +548,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       platformID: config.platformID,
       logLevel: resolvedConfig.sdkLogLevel ?? LogLevel.Warn,
     });
+    api.logger?.info?.(`[openim][startup] login success account=${config.accountId} userID=${config.userID}`);
     clients.set(config.accountId, state);
     startLivenessMonitor(api, state as OpenIMClientState);
     api.logger?.info?.(`[openim] account ${config.accountId} connected`);

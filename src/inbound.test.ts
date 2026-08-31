@@ -194,6 +194,50 @@ test("duplicate SDK callbacks do not issue duplicate mark-as-read requests", asy
   assert.equal(markReadCalls, 1);
 });
 
+test("mark-as-read uses the SDK login ID when inbound recvID is stale", async () => {
+  let markedConversationID = "";
+  let markReadStarted!: () => void;
+  const markReadStartedPromise = new Promise<void>((resolve) => {
+    markReadStarted = resolve;
+  });
+  const sdk = {
+    async markConversationMessageAsRead(conversationID: string) {
+      markedConversationID = conversationID;
+      markReadStarted();
+      return { data: null };
+    },
+    async getUsersInfo() {
+      return { data: [{ userID: "user-1", nickname: "User One" }] };
+    },
+    async createCustomMessage(input: { data: string }) {
+      return { data: { customElem: input } };
+    },
+    async sendMessage() {
+      return { data: {} };
+    },
+  };
+  const client = state(sdk);
+  const api = {
+    config: {},
+    logger: silentLogger(),
+    runtime: {
+      channel: {
+        reply: {
+          async dispatchReplyWithBufferedBlockDispatcher(params: any) {
+            await params.dispatcherOptions.deliver({ text: "reply" }, { kind: "final" });
+          },
+        },
+      },
+    },
+  };
+  const inbound = { ...message("stale-recv-id"), recvID: "old-bot-id" } as MessageItem;
+
+  await processInboundMessage(api, client, inbound, "live");
+  await markReadStartedPromise;
+
+  assert.equal(markedConversationID, "si_bot_user-1");
+});
+
 test("a stuck mark-as-read request cannot block Orange dispatch", async () => {
   let dispatchCalls = 0;
   const sdk = {
