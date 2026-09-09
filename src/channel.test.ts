@@ -1,6 +1,6 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { OpenIMChannelPlugin } from "./channel";
+import { OpenIMChannelPlugin, renderOutboundBody } from "./channel";
 import { __setTestClient, __clearTestClients } from "./clients";
 import { isStdoutBroken } from "./liveness";
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
@@ -52,6 +52,22 @@ function makeState(sdk: any): OpenIMClientState {
 
 beforeEach(() => { __clearTestClients(); });
 afterEach(() => { __clearTestClients(); });
+
+test("renders structured rich content as non-empty OpenIM text", () => {
+  assert.equal(
+    renderOutboundBody("fallback", {
+      zh_cn: {
+        content: [[{ tag: "text", text: "任务已完成" }], [{ tag: "text", text: "请查看结果" }]],
+      },
+    }),
+    "任务已完成\n请查看结果",
+  );
+  assert.equal(renderOutboundBody("fallback", [{ text: "plain block" }]), "plain block");
+});
+
+test("falls back to text for unsupported rich content", () => {
+  assert.equal(renderOutboundBody("fallback", { unsupported: true }), "fallback");
+});
 
 test("success updates lastFlushMs", async () => {
   const state = makeState(fakeSdk());

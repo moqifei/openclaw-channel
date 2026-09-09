@@ -9,6 +9,67 @@ import { isPipeBrokenError, markStdoutBroken, scheduleStdoutBrokenExit, updateLa
 /** 模块级 logger，由 gateway.startAccount 注册，供 outbound 等无 logger 句柄的入口使用。 */
 let channelLogger: any = undefined;
 
+/**
+ * 把结构化内容（orange 的 `blocks`）拍平成 OpenIM 可承载的文本。
+ *
+ * orange 的 `send_outbound_post` 会把富文本（如飞书 post JSON）放进 `blocks`
+ * 并把 `text` 置空；本渠道目前只承载文本，若直接忽略 `blocks`，收件人将收到
+ * 一条**空消息**。因此这里做保守拍平：能识别的形状还原为可读文本，识别不了则
+ * 记警告并回退到 `text`。
+ */
+export function renderOutboundBody(text?: string, blocks?: unknown): string {
+  const flattened = flattenBlocks(blocks);
+  if (flattened) return flattened;
+  if (blocks !== undefined && blocks !== null && !flattened) {
+    channelLogger?.warn?.(
+      `[openim] outbound: could not render blocks to text; falling back to text (blocksType=${typeof blocks})`,
+    );
+  }
+  return text ?? "";
+}
+
+function flattenBlocks(blocks: unknown): string {
+  if (blocks === undefined || blocks === null) return "";
+  if (Array.isArray(blocks)) return renderContent(blocks);
+  if (typeof blocks === "object") {
+    const node = blocks as Record<string, unknown>;
+    // 飞书 post 形状：{ zh_cn: { content: [[{ tag: "text", text: "..." }]] } }
+    for (const locale of ["zh_cn", "en_us", "ja_jp"]) {
+      const rendered = renderContent((node[locale] as Record<string, unknown> | undefined)?.content);
+      if (rendered) return rendered;
+    }
+    return renderContent(node.content ?? node.blocks);
+  }
+  if (typeof blocks === "string") return blocks;
+  return "";
+}
+
+/** 把 content（可能是 [[node]] 或 [node]）渲染为多行文本。 */
+function renderContent(content: unknown): string {
+  if (!content) return "";
+  const rows = Array.isArray(content) ? content : [content];
+  const lines: string[] = [];
+  for (const row of rows) {
+    const line = renderInline(Array.isArray(row) ? row : [row]);
+    if (line) lines.push(line);
+  }
+  return lines.join("\n").trim();
+}
+
+function renderInline(nodes: unknown[]): string {
+  let out = "";
+  for (const node of nodes) {
+    if (typeof node === "string") {
+      out += node;
+    } else if (node && typeof node === "object") {
+      const record = node as Record<string, unknown>;
+      if (typeof record.text === "string") out += record.text;
+      else if (typeof record.content === "string") out += record.content;
+    }
+  }
+  return out;
+}
+
 export const OpenIMChannelPlugin = {
   id: "openim",
   meta: {
@@ -36,21 +97,33 @@ export const OpenIMChannelPlugin = {
       }
       return { ok: true, to: `${target.kind}:${target.id}` };
     },
-    sendText: async ({ to, text, accountId }: { to: string; text: string; accountId?: string }) => {
+    sendText: async ({
+      to,
+      text,
+      accountId,
+      blocks,
+    }: {
+      to: string;
+      text: string;
+      accountId?: string;
+      blocks?: unknown;
+    }) => {
       const target = parseTarget(to);
       if (!target) {
         return { ok: false, error: new Error("invalid target, expected user:<id> or group:<id>") };
       }
+      // 富文本（blocks）优先：否则 post 内容会被当作空 text 发出去。
+      const body = renderOutboundBody(text, blocks);
       const client = getConnectedClient(accountId);
       if (!client) {
         channelLogger?.warn?.(`[openim] outbound.sendText: OpenIM not connected (account=${accountId ?? "<none>"}, to=${to})`);
         return { ok: false, error: new Error("OpenIM not connected") };
       }
       try {
-        await sendTextToTarget(client, target, text);
+        await sendTextToTarget(client, target, body);
         // 反向存活探测：成功写回对端（orange）即更新发侧健康时间戳。
         updateLastFlush(client, Date.now());
-        (client as any).logger?.info?.(`[openim] outbound.sendText OK: to=${to} textChars=${text.length}`);
+        (client as any).logger?.info?.(`[openim] outbound.sendText OK: to=${to} textChars=${body.length}`);
         return { ok: true, provider: "openim" };
       } catch (e: any) {
         (client as any).logger?.warn?.(`[openim] outbound.sendText FAILED: to=${to} error=${formatSdkError(e)}`);
