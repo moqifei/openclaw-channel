@@ -1,4 +1,6 @@
-import { getOpenIMUserInfoCache } from "./user";
+import { getConnectedClient } from "./clients";
+import { OpenIMDigitalTwinProtocol } from "./digital-twin";
+import { getOpenIMUserInfoCache, resolveOpenIMUserInfo, type OpenIMUserInfo } from "./user";
 
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 
@@ -7,6 +9,46 @@ function isOpenIMPayload(payload: any): boolean {
   if (channel) return channel === "openim";
   const userId = String(payload?.user_id ?? "").trim();
   return userId.startsWith("openim:");
+}
+
+function stripOpenIMPrefix(value: unknown): string {
+  return String(value ?? "").replace(/^openim:/i, "").trim();
+}
+
+interface CallerIdentity {
+  /** 网关调用实际使用的身份（token / username 都基于它解析）。 */
+  userID: string;
+  /** 原始入站发送者，仅用于审计头。 */
+  senderUserID: string;
+  /** 非空表示本次调用发生在数字分身上下文中，值为分身主人 ID。 */
+  ownerUserID: string;
+}
+
+/**
+ * 决定本次网关调用应以「谁」的身份发起。
+ *
+ * - 普通 IM 机器人模式：使用入站发送者（sender）。
+ * - 数字分身模式：必须使用分身「主人」（owner），而不是消息发送者。
+ *   原因有二：
+ *   1) 语义上分身是代表主人回话的（"查一下你的 OA 待办" 指的是主人的待办，
+ *      用发送者身份会查到别人的数据）；
+ *   2) 工程上发送者 ID 从未被解析进用户信息缓存（inbound.ts 只解析普通入站
+ *      发送者，分身链路不走那里），用它查缓存必然 not found，导致 token 与
+ *      用户名注入被跳过，网关收不到真实账号（拼音姓名）而拒绝请求。
+ *      分身主人的信息会在 openim_digital_twin_prepare 阶段被解析并缓存，
+ *      因此以 owner 身份查找是可靠且语义正确的。
+ */
+function resolveCallerIdentity(payload: any): CallerIdentity {
+  const senderUserID = stripOpenIMPrefix(payload?.user_id);
+  const accountId = String(payload?.account_id ?? "").trim();
+  const prefix = OpenIMDigitalTwinProtocol.accountScopePrefix;
+  if (prefix && accountId.toLowerCase().startsWith(prefix.toLowerCase())) {
+    const ownerUserID = stripOpenIMPrefix(accountId.slice(prefix.length));
+    if (ownerUserID) {
+      return { userID: ownerUserID, senderUserID, ownerUserID };
+    }
+  }
+  return { userID: senderUserID, senderUserID, ownerUserID: "" };
 }
 
 export function registerHttpTokenInjector(api: any): void {
@@ -27,6 +69,37 @@ export function registerHttpTokenInjector(api: any): void {
     return;
   }
 
+  /**
+   * 取用户信息：命中缓存直接返回，缺失或过期则按需重新解析。
+   * 数字分身自测、缓存被清理、首次调用等场景都能兜住，而不是直接放弃注入。
+   */
+  const loadUserInfo = async (
+    payload: any,
+    identity: CallerIdentity
+  ): Promise<OpenIMUserInfo | undefined> => {
+    const userID = identity.userID;
+    const cached = getOpenIMUserInfoCache().get(userID);
+    if (cached && cached.username && Date.now() - cached.fetchedAt <= userCacheTtlMs) {
+      return cached;
+    }
+    if (cached) getOpenIMUserInfoCache().delete(userID);
+
+    try {
+      // 分身没有自己的 WS 账号（perTwinAccount=false），传 undefined 让
+      // getConnectedClient 回落到 default/第一个在线账号来做用户查询。
+      const client = getConnectedClient(identity.ownerUserID ? undefined : String(payload?.account_id ?? "").trim() || undefined);
+      if (!client) return undefined;
+      return await resolveOpenIMUserInfo({
+        client,
+        userID,
+        log: (line) => api.logger?.warn?.(String(line)),
+      });
+    } catch (err) {
+      api.logger?.warn?.(`[openim/http-token-injector] resolve user info failed for ${userID}: ${String(err)}`);
+      return undefined;
+    }
+  };
+
   const hookHandler = async (payload: any): Promise<any> => {
     if (!isOpenIMPayload(payload)) {
       return { action: "continue" };
@@ -42,25 +115,23 @@ export function registerHttpTokenInjector(api: any): void {
       return { action: "continue" };
     }
 
-    const userID = String(payload?.user_id ?? "").replace(/^openim:/i, "").trim();
+    const identity = resolveCallerIdentity(payload);
+    const userID = identity.userID;
     if (!userID) {
       return { action: "continue" };
     }
 
-    const userInfo = getOpenIMUserInfoCache().get(userID);
+    const userInfo = await loadUserInfo(payload, identity);
     api.logger?.info?.(
-      `[openim/http-token-injector] hook triggered: tool=${toolName} user=${userID} url=${url} userInfo=${
-        userInfo ? `name=${userInfo.name} username=${userInfo.username}` : "not found"
-      }`
+      `[openim/http-token-injector] hook triggered: tool=${toolName} user=${userID}` +
+        (identity.ownerUserID
+          ? ` (digital-twin owner=${identity.ownerUserID} sender=${identity.senderUserID || "-"})`
+          : "") +
+        ` url=${url} userInfo=${
+          userInfo ? `name=${userInfo.name} username=${userInfo.username}` : "not found"
+        }`
     );
-    if (!userInfo) {
-      return { action: "continue" };
-    }
-    if (Date.now() - userInfo.fetchedAt > userCacheTtlMs) {
-      getOpenIMUserInfoCache().delete(userID);
-      return { action: "continue" };
-    }
-    if (!userInfo.username) {
+    if (!userInfo || !userInfo.username) {
       return { action: "continue" };
     }
 
@@ -101,6 +172,14 @@ export function registerHttpTokenInjector(api: any): void {
       return { action: "continue" };
     }
 
+    const auditHeaders: Record<string, string> = {};
+    if (identity.ownerUserID) {
+      auditHeaders["X-Digital-Twin-Owner"] = identity.ownerUserID;
+    }
+    if (identity.senderUserID && identity.senderUserID !== userID) {
+      auditHeaders["X-Sender-Id"] = identity.senderUserID;
+    }
+
     return {
       action: "modify",
       payload: {
@@ -114,6 +193,7 @@ export function registerHttpTokenInjector(api: any): void {
             token,
             "X-User-Id": userID,
             "X-User-Name": userInfo.name,
+            ...auditHeaders,
           },
         },
       },
